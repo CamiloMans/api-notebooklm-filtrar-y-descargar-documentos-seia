@@ -1,0 +1,17 @@
+.claude/
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.err.log
+*.out.log
+.env
+.env.*
+.venv/
+venv/
+downloads/
+deploy/
+token.json
+client_secret.json
+seia_cache.sqlite
+.git/

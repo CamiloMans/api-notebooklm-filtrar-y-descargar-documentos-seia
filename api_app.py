@@ -1,0 +1,1979 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""API MVP para procesar documento SEIA y persistir notebook en Supabase."""
+
+import asyncio
+import base64
+import json
+import os
+import threading
+import uuid
+import zipfile
+from pathlib import Path, PurePosixPath
+from typing import Any, Callable, Dict, List, Literal, Optional
+from urllib.parse import urlparse
+
+from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from pydantic import BaseModel, Field
+from supabase import Client, create_client
+
+from notebooklm import (
+    AuthError,
+    AuthTokens,
+    NotebookLMClient,
+    RPCError,
+    SharePermission,
+    ShareViewLevel,
+)
+from notebooklm.auth import fetch_tokens
+
+try:
+    from dotenv import load_dotenv
+except ImportError:
+    load_dotenv = None
+
+from download_documento_seia import (
+    DEFAULT_OUTPUT,
+    NOTEBOOK_UPLOAD_LIMIT,
+    NotebookAPIError,
+    _long_path,
+    _path_exists,
+    build_adenda_notebook_title,
+    build_notebook_upload_filename,
+    build_tipo_notebook_title,
+    compact_component,
+    extract_id_documento,
+    force_https,
+    notify_notebook_api,
+    prepare_notebook_client_seed,
+    run_seia_notebook_pipeline,
+    upload_documents_batch_and_single,
+)
+
+if load_dotenv:
+    load_dotenv()
+
+
+API_BASE_DIR = Path(__file__).resolve().parent
+API_BEARER_TOKEN = os.getenv("API_BEARER_TOKEN", "").strip()
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+NOTEBOOK_API_BASE_URL = os.getenv("NOTEBOOK_API_BASE_URL", "http://127.0.0.1:8001").strip()
+API_OUTPUT_ROOT = Path(os.getenv("API_OUTPUT_ROOT", str(DEFAULT_OUTPUT / "api_runs")))
+if not API_OUTPUT_ROOT.is_absolute():
+    API_OUTPUT_ROOT = (API_BASE_DIR / API_OUTPUT_ROOT).resolve()
+CORS_ORIGINS_RAW = os.getenv(
+    "API_CORS_ORIGINS",
+    "http://localhost:3000,http://127.0.0.1:3000",
+).strip()
+
+
+def getenv_positive_int(name: str, default: int) -> int:
+    """Lee enteros positivos desde entorno usando un fallback seguro."""
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return default
+    return max(1, parsed_value)
+
+
+MAX_CONCURRENT_JOBS = getenv_positive_int("MAX_CONCURRENT_JOBS", 3)
+_SUPABASE_CLIENT: Optional[Client] = None
+_JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
+RETRYABLE_UPLOAD_STATUSES = ("failed", "not_uploaded", "selected", "uploading", "pending")
+NOTEBOOK_AUTH_HEADER = "X-NotebookLM-Auth"
+
+
+def parse_cors_origins(raw_value: str) -> List[str]:
+    """Parsea origenes CORS desde variable de entorno separada por comas."""
+    origins = []
+    for item in (raw_value or "").split(","):
+        value = item.strip()
+        if value:
+            origins.append(value)
+    return origins
+
+
+def decode_notebook_auth_header_value(raw_value: str) -> Dict[str, Any]:
+    """Decodifica el payload compacto de auth NotebookLM enviado por header."""
+    normalized_value = (raw_value or "").strip()
+    if not normalized_value:
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} no puede venir vacio.")
+
+    padding = "=" * (-len(normalized_value) % 4)
+    try:
+        decoded_bytes = base64.urlsafe_b64decode(f"{normalized_value}{padding}".encode("ascii"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} no tiene un base64url valido.") from exc
+
+    try:
+        payload = json.loads(decoded_bytes.decode("utf-8"))
+    except Exception as exc:  # noqa: BLE001
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} no contiene un JSON valido.") from exc
+
+    if not isinstance(payload, dict):
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} debe contener un objeto JSON.")
+    if payload.get("version") != 1:
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} debe incluir version=1.")
+
+    raw_cookies = payload.get("cookies")
+    if not isinstance(raw_cookies, dict):
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} debe incluir un objeto 'cookies'.")
+
+    cookies: Dict[str, str] = {}
+    for raw_name, raw_value in raw_cookies.items():
+        if raw_value is None:
+            continue
+        name = str(raw_name).strip()
+        value = str(raw_value)
+        if name and value:
+            cookies[name] = value
+
+    if "SID" not in cookies:
+        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} no incluye la cookie SID.")
+
+    return {
+        "version": 1,
+        "cookies": cookies,
+        "cookie_names": [
+            str(name).strip()
+            for name in payload.get("cookie_names", [])
+            if str(name).strip()
+        ] or sorted(cookies.keys()),
+        "cookie_domains": [
+            str(domain).strip()
+            for domain in payload.get("cookie_domains", [])
+            if str(domain).strip()
+        ],
+    }
+
+
+class CreateNotebookRequest(BaseModel):
+    documento_seia: str = Field(..., description="URL de documento SEIA")
+    id_adenda: int = Field(..., gt=0, description="ID de la tabla adendas")
+
+
+class CreateCP6BRequest(BaseModel):
+    documento_seia: str = Field(..., description="URL de documento SEIA")
+    tipo: str = Field(..., min_length=1, description="Prefijo semantico que se antepone al nombre final de los archivos.")
+    exclude_keywords: List[str] = Field(
+        default_factory=list,
+        description="Palabras a excluir del listado CP6B. Si viene vacio, no se aplica filtro por palabras.",
+    )
+
+
+class CreateNotebookResponse(BaseModel):
+    status: str
+    id_adenda: int
+    id_documento: str
+    notebooklm_id: str
+    nombre_notebooklm: str
+    documents_found: int
+    documents_uploaded_ok: int
+    documents_uploaded_failed: int
+    output_dir: str
+    elapsed_seconds: float
+
+
+class CP6BDocumentResponse(BaseModel):
+    document_id: str
+    seleccionar: bool
+    selected: bool
+    categoria: str
+    texto_link: str
+    url_origen: str
+    nombre_archivo: str
+    nombre_archivo_final: str
+    nombre_archivo_notebook: str
+    nombre_para_notebook: str
+    formato: str
+    ruta_relativa: str
+    tamano_bytes: int
+    nivel_descarga_descompresion: int
+    origen: str
+    upload_status: str
+
+
+class CreateCP6BResponse(BaseModel):
+    status: str
+    run_id: str
+    tipo: str
+    id_documento: str
+    documents_found: int
+    documents: List[CP6BDocumentResponse]
+
+
+class CP6BStatusResponse(CreateCP6BResponse):
+    progress_stage: str
+    progress_current: int
+    progress_total: int
+    progress_percent: int
+    progress_message: str
+    error_message: str
+    notebooklm_id: str = ""
+    nombre_notebooklm: str = ""
+    retry_attempts: int = 0
+    retry_documents_count: int = 0
+    retry_document_ids: List[str] = []
+
+
+class UploadSelectionRequest(BaseModel):
+    run_id: str = Field(..., description="ID de corrida devuelto por /adenda/descarga-documentos-seia")
+    selected_document_ids: List[str] = Field(..., description="IDs de documentos seleccionados por el frontend")
+    nombre_notebook: Optional[str] = Field(
+        default=None,
+        description="Nombre del notebook a crear. Debe enviarse cuando se quiere crear un notebook nuevo.",
+    )
+    notebook_id: Optional[str] = Field(
+        default=None,
+        description="ID de un notebook existente. Debe enviarse cuando se quiere reutilizar un notebook ya creado.",
+    )
+
+
+class UploadSelectionResponse(BaseModel):
+    status: str
+    run_id: str
+    tipo: str
+    id_documento: str
+    notebooklm_id: str = ""
+    nombre_notebooklm: str
+    documents_uploaded_ok: int
+    documents_uploaded_failed: int
+    retry_attempts: int = 0
+    retry_documents_count: int = 0
+    retry_document_ids: List[str] = []
+    selected_documents: List[CP6BDocumentResponse]
+
+
+class RetryUploadRequest(BaseModel):
+    run_id: str = Field(..., description="ID de corrida previamente cargada al notebook.")
+
+
+class RetryUploadResponse(BaseModel):
+    status: str
+    run_id: str
+    notebooklm_id: str
+    documents_uploaded_ok: int
+    documents_uploaded_failed: int
+    retry_attempts: int = 0
+    retry_documents_count: int = 0
+    retry_document_ids: List[str] = []
+    selected_documents: List[CP6BDocumentResponse]
+
+
+class DownloadSelectedDocumentsZipRequest(BaseModel):
+    selected_document_ids: List[str] = Field(
+        ...,
+        description="IDs de documentos visibles/seleccionados por el frontend para exportar en zip.",
+    )
+
+
+class ShareSetPublicRequest(BaseModel):
+    public: bool = Field(..., description="True habilita sharing publico; False lo deshabilita.")
+
+
+class ShareSetViewLevelRequest(BaseModel):
+    view_level: Literal["full_notebook", "chat_only"] = Field(
+        ..., description="Scope para viewers del notebook compartido."
+    )
+
+
+class ShareAddUserRequest(BaseModel):
+    email: str = Field(..., min_length=3, description="Email del usuario a invitar.")
+    permission: Literal["viewer", "editor"] = Field(default="viewer")
+    notify: bool = Field(default=True)
+    welcome_message: str = Field(default="")
+
+
+class ShareUpdateUserRequest(BaseModel):
+    permission: Literal["viewer", "editor"] = Field(..., description="Nuevo nivel de permiso.")
+
+
+app = FastAPI(
+    title="SEIA Notebook API",
+    version="1.0.0",
+    description="Crea notebook desde documento SEIA y persiste notebooklm_id en Supabase.",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=parse_cors_origins(CORS_ORIGINS_RAW),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+def get_supabase_client() -> Client:
+    """Retorna cliente Supabase singleton."""
+    global _SUPABASE_CLIENT
+    if _SUPABASE_CLIENT is None:
+        if not SUPABASE_URL or not SUPABASE_KEY:
+            raise RuntimeError("SUPABASE_URL/SUPABASE_KEY no configurados.")
+        _SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_KEY)
+    return _SUPABASE_CLIENT
+
+
+def require_bearer_token(authorization: Optional[str] = Header(default=None)) -> None:
+    """Valida Authorization bearer token."""
+    if not API_BEARER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="API_BEARER_TOKEN no configurado en entorno.",
+        )
+
+    if not authorization:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def get_notebook_auth_payload(
+    x_notebooklm_auth: Optional[str] = Header(default=None, alias=NOTEBOOK_AUTH_HEADER),
+) -> Optional[Dict[str, Any]]:
+    """Decodifica auth NotebookLM por request cuando el header viene presente."""
+    if not x_notebooklm_auth or not x_notebooklm_auth.strip():
+        return None
+
+    try:
+        return decode_notebook_auth_header_value(x_notebooklm_auth)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc),
+        ) from exc
+
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token.strip() != API_BEARER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
+def _parse_share_permission(value: str) -> SharePermission:
+    return {"viewer": SharePermission.VIEWER, "editor": SharePermission.EDITOR}[value]
+
+
+def _parse_share_view_level(value: str) -> ShareViewLevel:
+    return {
+        "full_notebook": ShareViewLevel.FULL_NOTEBOOK,
+        "chat_only": ShareViewLevel.CHAT_ONLY,
+    }[value]
+
+
+def _validate_email(email: str) -> str:
+    cleaned = (email or "").strip()
+    if "@" not in cleaned:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="email debe tener formato valido (ej: usuario@dominio.com).",
+        )
+    local, _, domain = cleaned.partition("@")
+    if not local or "." not in domain:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="email debe tener formato valido (ej: usuario@dominio.com).",
+        )
+    return cleaned
+
+
+def _share_status_payload(share_status: Any) -> Dict[str, Any]:
+    users = [
+        {
+            "email": user.email,
+            "permission": user.permission.name.lower(),
+            "display_name": user.display_name,
+            "avatar_url": user.avatar_url,
+        }
+        for user in share_status.shared_users
+    ]
+    return {
+        "notebook_id": share_status.notebook_id,
+        "is_public": share_status.is_public,
+        "access": share_status.access.name.lower(),
+        "view_level": share_status.view_level.name.lower(),
+        "share_url": share_status.share_url,
+        "shared_users": users,
+    }
+
+
+def _map_notebook_share_exception(exc: Exception) -> HTTPException:
+    if isinstance(exc, HTTPException):
+        return exc
+    message = str(exc).strip() or exc.__class__.__name__
+    if isinstance(exc, AuthError):
+        return HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Sesion NotebookLM invalida o expirada: {message}",
+        )
+    if isinstance(exc, RPCError):
+        return HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Error RPC NotebookLM: {message}",
+        )
+    if isinstance(exc, ValueError):
+        return HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=message,
+        )
+    return HTTPException(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        detail=message,
+    )
+
+
+def run_notebook_share_operation(
+    notebook_auth: Optional[Dict[str, Any]],
+    operation: Callable[[NotebookLMClient], Any],
+    *,
+    timeout: float = 60.0,
+) -> Any:
+    """Crea NotebookLMClient por request con auth del header y ejecuta operacion async."""
+    if not notebook_auth:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"Falta header {NOTEBOOK_AUTH_HEADER} valido con cookies NotebookLM.",
+        )
+
+    cookies = notebook_auth.get("cookies") or {}
+    if not cookies:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=f"{NOTEBOOK_AUTH_HEADER} no contiene cookies validas.",
+        )
+
+    async def _run() -> Any:
+        csrf_token, session_id = await fetch_tokens(dict(cookies))
+        tokens = AuthTokens(
+            cookies=dict(cookies),
+            csrf_token=str(csrf_token),
+            session_id=str(session_id),
+        )
+        async with NotebookLMClient(tokens, timeout=timeout) as client:
+            return await operation(client)
+
+    try:
+        return asyncio.run(_run())
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise _map_notebook_share_exception(exc) from exc
+
+
+def validate_documento_seia(documento_seia: str) -> str:
+    """Valida URL de documento SEIA y retorna versión normalizada."""
+    raw = (documento_seia or "").strip()
+    if not raw:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="documento_seia es requerido",
+        )
+
+    if "://" not in raw:
+        raw = f"https://{raw}"
+    normalized = force_https(raw)
+    parsed = urlparse(normalized)
+    host = (parsed.netloc or "").lower()
+    path = (parsed.path or "").lower()
+
+    is_seia_document = "seia.sea.gob.cl" in host and "/documentos/documento.php" in path
+    is_infofirma_document = "infofirma.sea.gob.cl" in host and "/documentossea/mostrardocumento" in path
+    if not (is_seia_document or is_infofirma_document):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "documento_seia debe apuntar a un documento valido de "
+                "seia.sea.gob.cl o infofirma.sea.gob.cl"
+            ),
+        )
+
+    id_documento = extract_id_documento(normalized)
+    if not id_documento or id_documento == "desconocido":
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="documento_seia debe incluir query param idDocumento",
+        )
+
+    return normalized
+
+
+def validate_tipo(tipo: str) -> str:
+    """Valida y normaliza el tipo usado como prefijo semantico."""
+    value = (tipo or "").strip()
+    if not value:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="tipo es requerido",
+        )
+    return value
+
+
+def normalize_optional_text(value: Optional[str]) -> Optional[str]:
+    """Normaliza texto opcional devolviendo None cuando queda vacio."""
+    normalized = (value or "").strip()
+    return normalized or None
+
+
+def safe_id_documento_token(id_documento: str) -> str:
+    """Normaliza el id_documento para usarlo en nombres de carpetas locales."""
+    return compact_component(str(id_documento or "desconocido"), maxlen=60)
+
+
+def adenda_exists(client: Client, id_adenda: int) -> bool:
+    """Verifica existencia de adenda por id."""
+    response = client.table("adendas").select("id").eq("id", id_adenda).limit(1).execute()
+    data = getattr(response, "data", None) or []
+    return len(data) > 0
+
+
+def persist_adenda_notebook(client: Client, id_adenda: int, notebook_id: str, notebook_name: str) -> None:
+    """Actualiza notebooklm_id y nombre_notebooklm en Supabase."""
+    payload = {
+        "notebooklm_id": notebook_id,
+        "nombre_notebooklm": notebook_name,
+    }
+    response = client.table("adendas").update(payload).eq("id", id_adenda).execute()
+    data = getattr(response, "data", None) or []
+    if not data:
+        raise RuntimeError("Update de adendas no devolvio filas afectadas.")
+
+
+def supabase_data(response) -> List[Dict[str, Any]]:
+    """Extrae data de una respuesta Supabase."""
+    data = getattr(response, "data", None) or []
+    return list(data)
+
+
+def json_safe(value: Any) -> Any:
+    """Convierte estructuras de Python a valores seguros para columnas JSON."""
+    if isinstance(value, dict):
+        return {str(k): json_safe(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple, set)):
+        return [json_safe(v) for v in value]
+    if isinstance(value, Path):
+        return str(value)
+    return value
+
+
+def run_metadata_dict(run: Dict[str, Any]) -> Dict[str, Any]:
+    """Retorna metadata de corrida como dict mutable y segura."""
+    metadata = run.get("metadata")
+    return dict(metadata) if isinstance(metadata, dict) else {}
+
+
+def to_int(value: Any, default: int = 0) -> int:
+    """Convierte valores numericos de forma tolerante para respuestas API."""
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def with_run_context(row: Dict[str, Any], tipo: str = "") -> Dict[str, Any]:
+    """Inyecta contexto de corrida en una fila de documento sin mutar el original."""
+    enriched = dict(row)
+    if tipo and not enriched.get("tipo"):
+        enriched["tipo"] = tipo
+    return enriched
+
+
+def public_document_from_row(row: Dict[str, Any], tipo: str = "") -> CP6BDocumentResponse:
+    """Construye el contrato publico del documento sin exponer ruta absoluta."""
+    row = with_run_context(row, tipo=tipo)
+    notebook_name = str(
+        row.get("nombre_para_notebook")
+        or row.get("nombre_archivo_notebook")
+        or build_notebook_upload_filename(row)
+    )
+    return CP6BDocumentResponse(
+        document_id=str(row["id"]),
+        seleccionar=bool(row.get("seleccionar", row.get("selected", True))),
+        selected=bool(row.get("selected", row.get("seleccionar", True))),
+        categoria=str(row.get("categoria") or ""),
+        texto_link=str(row.get("texto_link") or ""),
+        url_origen=str(row.get("url_origen") or ""),
+        nombre_archivo=str(row.get("nombre_archivo") or ""),
+        nombre_archivo_final=str(row.get("nombre_archivo_final") or row.get("nombre_archivo") or ""),
+        nombre_archivo_notebook=notebook_name,
+        nombre_para_notebook=notebook_name,
+        formato=str(row.get("formato") or ""),
+        ruta_relativa=str(row.get("ruta_relativa") or ""),
+        tamano_bytes=to_int(row.get("tamano_bytes")),
+        nivel_descarga_descompresion=to_int(row.get("nivel_descarga_descompresion")),
+        origen=str(row.get("origen") or ""),
+        upload_status=str(row.get("upload_status") or "pending"),
+    )
+
+
+def create_cp6b_run_record(
+    client: Client,
+    run_id: str,
+    tipo: str,
+    documento_seia: str,
+    id_documento: str,
+    output_dir: str,
+    exclude_keywords: List[str],
+) -> None:
+    """Crea corrida inicial para procesamiento asincrono."""
+    run_payload = {
+        "id": run_id,
+        "tipo": tipo,
+        "id_documento": id_documento,
+        "documento_seia": documento_seia,
+        "output_dir": output_dir,
+        "status": "queued",
+        "metadata": {},
+        "docs_report_stats": {},
+        "trace_stats": {},
+        "exclude_keywords": json_safe(exclude_keywords),
+        "progress_stage": "queued",
+        "progress_current": 0,
+        "progress_total": 0,
+        "progress_percent": 0,
+        "progress_message": "Corrida creada y en cola.",
+        "error_message": "",
+    }
+    client.table("adenda_document_runs").insert(run_payload).execute()
+
+
+def persist_cp6b_run_result(
+    client: Client,
+    run_id: str,
+    result: Dict[str, Any],
+) -> List[CP6BDocumentResponse]:
+    """Persiste resultado final CP6B y documentos enriquecidos."""
+    documents = []
+    file_payloads = []
+    run_tipo = str(result.get("tipo") or "")
+    for item in result.get("docs_report") or []:
+        document_id = str(uuid.uuid4())
+        file_row = {
+            "id": document_id,
+            "run_id": run_id,
+            "nombre_archivo": item.get("nombre_archivo") or "",
+            "nombre_archivo_final": item.get("nombre_archivo_final") or item.get("nombre_archivo") or "",
+            "extension": item.get("extension") or "",
+            "formato": item.get("formato") or "",
+            "ruta_relativa": item.get("ruta_relativa") or "",
+            "tamano_bytes": to_int(item.get("tamano_bytes")),
+            "nivel_descarga_descompresion": to_int(item.get("nivel_descarga_descompresion")),
+            "origen": item.get("origen") or "",
+            "categoria": item.get("categoria") or "",
+            "texto_link": item.get("texto_link") or "",
+            "url_origen": item.get("url_origen") or "",
+            "seleccionar": bool(item.get("seleccionar", True)),
+            "selected": bool(item.get("selected", True)),
+            "upload_status": "pending",
+            "upload_error": "",
+        }
+        file_payloads.append(file_row)
+        documents.append(public_document_from_row(file_row, tipo=run_tipo))
+
+    if file_payloads:
+        client.table("adenda_document_files").delete().eq("run_id", run_id).execute()
+        client.table("adenda_document_files").insert(file_payloads).execute()
+
+    client.table("adenda_document_runs").update({
+        "status": "listed",
+        "metadata": json_safe(result.get("metadata") or {}),
+        "docs_report_stats": json_safe(result.get("docs_report_stats") or {}),
+        "trace_stats": json_safe(result.get("trace_stats") or {}),
+        "listado_excel_path": result.get("excel_path"),
+        "trace_excel_path": result.get("trace_excel_path"),
+        "progress_stage": "listed",
+        "progress_current": len(file_payloads),
+        "progress_total": max(1, len(file_payloads)),
+        "progress_percent": 100 if file_payloads else 0,
+        "progress_message": "Listado CP6B generado.",
+        "error_message": "",
+    }).eq("id", run_id).execute()
+    return documents
+
+
+def update_run_progress(client: Client, run_id: str, payload: Dict[str, Any]) -> None:
+    """Actualiza progreso incremental de la corrida."""
+    current = to_int(payload.get("current"))
+    total = to_int(payload.get("total"))
+    percent = 0
+    if total > 0:
+        percent = max(0, min(100, int((current / total) * 100)))
+    stage = str(payload.get("stage") or "running")
+    if stage in {"upload_queued", "creating_notebook", "uploading"}:
+        run_status = "uploading"
+    elif stage in {"listed", "completed"}:
+        run_status = "listed"
+    else:
+        run_status = "running"
+    update_payload = {
+        "status": run_status,
+        "progress_stage": str(payload.get("stage") or "running"),
+        "progress_current": current,
+        "progress_total": total,
+        "progress_percent": percent,
+        "progress_message": str(payload.get("message") or ""),
+    }
+    client.table("adenda_document_runs").update(update_payload).eq("id", run_id).execute()
+
+
+def mark_run_failed(client: Client, run_id: str, error_message: str) -> None:
+    """Marca corrida fallida en Supabase."""
+    client.table("adenda_document_runs").update({
+        "status": "failed",
+        "progress_stage": "failed",
+        "progress_percent": 0,
+        "progress_message": "La corrida fallo.",
+        "error_message": error_message[:2000],
+    }).eq("id", run_id).execute()
+
+
+def queue_notebook_upload_selection(
+    client: Client,
+    run_id: str,
+    selected_ids: List[str],
+    notebook_name: str,
+    existing_notebook_id: Optional[str],
+) -> None:
+    """Marca la seleccion para carga y deja la corrida lista para background upload."""
+    run = load_run(client, run_id)
+    metadata = run_metadata_dict(run)
+    metadata["retry_upload_attempts"] = 0
+    client.table("adenda_document_files").update({
+        "seleccionar": False,
+        "selected": False,
+        "upload_status": "pending",
+        "upload_error": "",
+    }).eq("run_id", run_id).execute()
+    client.table("adenda_document_files").update({
+        "seleccionar": True,
+        "selected": True,
+        "upload_status": "selected",
+        "upload_error": "",
+    }).in_("id", selected_ids).execute()
+
+    progress_total = max(1, len(selected_ids))
+    run_update_payload = {
+        "status": "uploading",
+        "nombre_notebooklm": notebook_name,
+        "metadata": json_safe(metadata),
+        "progress_stage": "upload_queued",
+        "progress_current": 0,
+        "progress_total": progress_total,
+        "progress_percent": 0,
+        "progress_message": "Carga al notebook en cola.",
+        "error_message": "",
+    }
+    if existing_notebook_id:
+        run_update_payload["notebooklm_id"] = existing_notebook_id
+    client.table("adenda_document_runs").update(run_update_payload).eq("id", run_id).execute()
+
+
+def update_document_upload_state(
+    client: Client,
+    document_id: str,
+    upload_status: str,
+    upload_error: str = "",
+) -> None:
+    """Actualiza estado individual de carga para un documento."""
+    client.table("adenda_document_files").update({
+        "upload_status": upload_status,
+        "upload_error": upload_error[:2000],
+    }).eq("id", document_id).execute()
+
+
+def retryable_document_ids(rows: List[Dict[str, Any]]) -> List[str]:
+    """Lista document_id que pueden reintentarse por no quedar cargados correctamente."""
+    ids = []
+    for row in rows:
+        is_selected = bool(row.get("selected", row.get("seleccionar", False)))
+        if not is_selected:
+            continue
+        status_value = str(row.get("upload_status") or "").strip().lower()
+        if status_value in RETRYABLE_UPLOAD_STATUSES:
+            ids.append(str(row.get("id") or ""))
+    return [doc_id for doc_id in ids if doc_id]
+
+
+def get_run_retry_attempts(run: Dict[str, Any]) -> int:
+    """Retorna cantidad de reintentos manuales de carga registrados para la corrida."""
+    metadata = run_metadata_dict(run)
+    return max(0, to_int(metadata.get("retry_upload_attempts")))
+
+
+def set_run_retry_attempts(
+    client: Client,
+    run_id: str,
+    run: Dict[str, Any],
+    retry_attempts: int,
+) -> int:
+    """Persiste contador de reintentos manuales en metadata sin requerir migracion adicional."""
+    metadata = run_metadata_dict(run)
+    normalized_attempts = max(0, retry_attempts)
+    metadata["retry_upload_attempts"] = normalized_attempts
+    client.table("adenda_document_runs").update({
+        "metadata": json_safe(metadata),
+    }).eq("id", run_id).execute()
+    run["metadata"] = metadata
+    return normalized_attempts
+
+
+def mark_remaining_documents_for_retry(
+    client: Client,
+    run_id: str,
+    selected_ids: List[str],
+    attempted_document_ids: List[str],
+    reason: str,
+) -> List[str]:
+    """Marca documentos seleccionados no intentados como pendientes de reintento."""
+    attempted_set = {str(doc_id).strip() for doc_id in attempted_document_ids if str(doc_id).strip()}
+    remaining_ids = [
+        str(doc_id).strip()
+        for doc_id in selected_ids
+        if str(doc_id).strip() and str(doc_id).strip() not in attempted_set
+    ]
+    if not remaining_ids:
+        return []
+    client.table("adenda_document_files").update({
+        "upload_status": "not_uploaded",
+        "upload_error": reason[:2000],
+    }).in_("id", remaining_ids).execute()
+    return remaining_ids
+
+
+def load_run(client: Client, run_id: str) -> Dict[str, Any]:
+    """Carga una corrida CP6B por id."""
+    response = (
+        client.table("adenda_document_runs")
+        .select("*")
+        .eq("id", run_id)
+        .limit(1)
+        .execute()
+    )
+    rows = supabase_data(response)
+    if not rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"No existe corrida CP6B con run_id={run_id}",
+        )
+    return rows[0]
+
+
+def load_run_documents(client: Client, run_id: str) -> List[Dict[str, Any]]:
+    """Carga todos los documentos de una corrida."""
+    response = (
+        client.table("adenda_document_files")
+        .select("*")
+        .eq("run_id", run_id)
+        .execute()
+    )
+    rows = supabase_data(response)
+    rows.sort(key=lambda row: (str(row.get("ruta_relativa") or "").lower(), str(row.get("id") or "")))
+    return rows
+
+
+def load_selected_documents(
+    client: Client,
+    run_id: str,
+    selected_document_ids: List[str],
+) -> List[Dict[str, Any]]:
+    """Carga y valida que todos los documentos pertenezcan a la corrida."""
+    response = (
+        client.table("adenda_document_files")
+        .select("*")
+        .eq("run_id", run_id)
+        .in_("id", selected_document_ids)
+        .execute()
+    )
+    rows = supabase_data(response)
+    rows_by_id = {str(row["id"]): row for row in rows}
+    missing = [doc_id for doc_id in selected_document_ids if doc_id not in rows_by_id]
+    if missing:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Hay documentos seleccionados que no pertenecen a esta corrida.",
+        )
+    return [rows_by_id[doc_id] for doc_id in selected_document_ids]
+
+
+def load_retryable_selected_documents(client: Client, run_id: str) -> List[Dict[str, Any]]:
+    """Retorna documentos seleccionados que siguen pendientes/fallidos tras la carga."""
+    rows = load_run_documents(client, run_id)
+    retryable_ids = set(retryable_document_ids(rows))
+    if not retryable_ids:
+        return []
+    return [row for row in rows if str(row.get("id") or "") in retryable_ids]
+
+
+def resolve_document_path(output_dir: str, ruta_relativa: str) -> str:
+    """Reconstruye ruta absoluta desde la corrida sin confiar en input del frontend."""
+    raw_output_dir = str(output_dir or "").strip()
+    if not raw_output_dir:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La corrida no tiene output_dir configurado.",
+        )
+
+    base_dir = Path(raw_output_dir)
+    if not base_dir.is_absolute():
+        base_dir = (API_BASE_DIR / base_dir).resolve()
+    else:
+        base_dir = base_dir.resolve()
+
+    candidate = (base_dir / ruta_relativa).resolve()
+    try:
+        candidate.relative_to(base_dir)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"Ruta relativa invalida en documento persistido: {ruta_relativa}",
+        ) from exc
+    return str(candidate)
+
+
+def sanitize_zip_entry_filename(file_name: str, fallback: str) -> str:
+    """Normaliza nombres de archivo para que se puedan extraer bien desde Windows."""
+    raw_name = str(file_name or "").strip()
+    candidate = PurePosixPath(raw_name.replace("\\", "/")).name.strip()
+    if not candidate:
+        candidate = str(fallback or "").strip()
+
+    safe_name = "".join(
+        ch if ch not in '<>:"/\\|?*' and ord(ch) >= 32 else "_"
+        for ch in candidate
+    ).strip(" .")
+    return safe_name or "documento"
+
+
+def build_retry_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -> Path:
+    """Empaqueta documentos pendientes/fallidos en un zip descargable para carga manual."""
+    output_dir = str(run.get("output_dir") or "").strip()
+    if not output_dir:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La corrida no tiene output_dir configurado para empaquetar documentos.",
+        )
+
+    base_dir = Path(resolve_document_path(output_dir, ".")).resolve()
+    export_dir = base_dir / "_manual_retry_exports"
+    os.makedirs(_long_path(export_dir), exist_ok=True)
+
+    run_id = str(run.get("id") or "").strip()
+    retry_attempts = get_run_retry_attempts(run)
+    zip_path = export_dir / (
+        f"documentos_fallidos_{run_id[:8] or 'corrida'}_retry_{retry_attempts}.zip"
+    )
+
+    seen_arc_names: set[str] = set()
+    included_count = 0
+    missing_entries: List[str] = []
+
+    # Los PDFs/ZIP ya vienen comprimidos, asi que usar ZIP_STORED acelera mucho la exportacion.
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zip_file:
+        for index, row in enumerate(rows, start=1):
+            ruta_relativa = str(row.get("ruta_relativa") or "")
+            fallback_name = str(
+                row.get("nombre_archivo_final") or row.get("nombre_archivo") or f"documento_{index}"
+            ).strip() or f"documento_{index}"
+            source_path = Path(resolve_document_path(output_dir, ruta_relativa))
+            if not _path_exists(source_path):
+                missing_entries.append(f"- {fallback_name}: no se encontro el archivo fisico.")
+                continue
+
+            relative_parts = [
+                part.strip()
+                for part in PurePosixPath(ruta_relativa.replace("\\", "/")).parts
+                if part not in {"", ".", ".."}
+            ]
+            if not relative_parts:
+                relative_parts = [fallback_name]
+
+            base_arc_name = PurePosixPath("documentos_fallidos", *relative_parts).as_posix()
+            arc_name = base_arc_name
+            suffix = 2
+            while arc_name in seen_arc_names:
+                arc_path = PurePosixPath(base_arc_name)
+                stem = arc_path.stem or "documento"
+                extension = arc_path.suffix
+                parent = arc_path.parent
+                arc_name = parent.joinpath(f"{stem}_{suffix}{extension}").as_posix()
+                suffix += 1
+
+            seen_arc_names.add(arc_name)
+            zip_file.write(_long_path(source_path), arc_name)
+            included_count += 1
+
+        readme_lines = [
+            "Documentos pendientes para carga manual en NotebookLM.",
+            "",
+            f"Corrida: {run_id or 'desconocida'}",
+            f"Reintentos manuales registrados: {retry_attempts}",
+            f"Documentos incluidos: {included_count}",
+        ]
+        if missing_entries:
+            readme_lines.extend([
+                "",
+                "Archivos no incluidos porque no se encontraron en disco:",
+                *missing_entries,
+            ])
+        zip_file.writestr("LEEME.txt", "\n".join(readme_lines))
+
+    if included_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No se encontraron archivos fisicos para empaquetar en el zip de fallidos.",
+        )
+
+    return zip_path
+
+
+def build_selected_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -> Path:
+    """Empaqueta documentos visibles usando nombre_para_notebook como nombre dentro del zip."""
+    output_dir = str(run.get("output_dir") or "").strip()
+    if not output_dir:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La corrida no tiene output_dir configurado para empaquetar documentos.",
+        )
+
+    base_dir = Path(resolve_document_path(output_dir, ".")).resolve()
+    export_dir = base_dir / "_table_exports"
+    os.makedirs(_long_path(export_dir), exist_ok=True)
+
+    run_id = str(run.get("id") or "").strip()
+    run_tipo = str(run.get("tipo") or "").strip()
+    zip_path = export_dir / f"documentos_para_notebook_{run_id[:8] or 'corrida'}.zip"
+
+    seen_arc_names: set[str] = set()
+    included_count = 0
+    missing_entries: List[str] = []
+
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zip_file:
+        for index, row in enumerate(rows, start=1):
+            ruta_relativa = str(row.get("ruta_relativa") or "")
+            fallback_name = str(
+                row.get("nombre_archivo_final") or row.get("nombre_archivo") or f"documento_{index}"
+            ).strip() or f"documento_{index}"
+            source_path = Path(resolve_document_path(output_dir, ruta_relativa))
+            if not _path_exists(source_path):
+                missing_entries.append(f"- {fallback_name}: no se encontro el archivo fisico.")
+                continue
+
+            public_document = public_document_from_row(row, tipo=run_tipo)
+            notebook_name = sanitize_zip_entry_filename(
+                public_document.nombre_para_notebook,
+                fallback_name,
+            )
+            notebook_path = PurePosixPath(notebook_name)
+            extension = notebook_path.suffix or Path(fallback_name).suffix
+            if not extension:
+                formato = str(row.get("formato") or "").strip().lstrip(".")
+                if formato:
+                    extension = f".{formato.lower()}"
+
+            stem = notebook_path.stem or f"documento_{index}"
+            archive_file_name = notebook_path.name
+            if extension and not notebook_path.suffix:
+                archive_file_name = f"{stem}{extension}"
+            elif not archive_file_name:
+                archive_file_name = f"{stem}{extension}"
+
+            base_arc_name = PurePosixPath(
+                "documentos_para_notebook",
+                archive_file_name,
+            ).as_posix()
+            arc_name = base_arc_name
+            suffix = 2
+            while arc_name in seen_arc_names:
+                arc_path = PurePosixPath(base_arc_name)
+                dup_stem = arc_path.stem or "documento"
+                dup_extension = arc_path.suffix
+                parent = arc_path.parent
+                arc_name = parent.joinpath(f"{dup_stem}_{suffix}{dup_extension}").as_posix()
+                suffix += 1
+
+            seen_arc_names.add(arc_name)
+            zip_file.write(_long_path(source_path), arc_name)
+            included_count += 1
+
+        readme_lines = [
+            "Documentos exportados desde la tabla CP6B para NotebookLM.",
+            "",
+            f"Corrida: {run_id or 'desconocida'}",
+            f"Documentos incluidos: {included_count}",
+            "Nombres dentro del ZIP: nombre_para_notebook.",
+        ]
+        if missing_entries:
+            readme_lines.extend(
+                [
+                    "",
+                    "Archivos no incluidos porque no se encontraron en disco:",
+                    *missing_entries,
+                ]
+            )
+        zip_file.writestr("LEEME.txt", "\n".join(readme_lines))
+
+    if included_count == 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No se encontraron archivos fisicos para empaquetar en el zip de la tabla.",
+        )
+
+    return zip_path
+
+
+def process_cp6b_listing_background(
+    run_id: str,
+    tipo: str,
+    normalized_url: str,
+    output_dir: str,
+    exclude_keywords: List[str],
+) -> None:
+    """Ejecuta la descarga CP6B en background y persiste estado/documentos."""
+    client = get_supabase_client()
+
+    def _progress(payload: Dict[str, Any]) -> None:
+        update_run_progress(client, run_id, payload)
+
+    try:
+        with _JOB_SEMAPHORE:
+            update_run_progress(client, run_id, {
+                "stage": "starting",
+                "current": 0,
+                "total": 1,
+                "message": "Iniciando procesamiento CP6B.",
+            })
+            result = run_seia_notebook_pipeline(
+                documento_seia=normalized_url,
+                tipo=tipo,
+                output_dir=output_dir,
+                output_base_dir=API_OUTPUT_ROOT,
+                skip_size_estimation=False,
+                no_extract=False,
+                keep_existing=False,
+                enable_download=True,
+                upload_limit=NOTEBOOK_UPLOAD_LIMIT,
+                notebook_title=None,
+                notebook_api_base_url=NOTEBOOK_API_BASE_URL,
+                require_notebook=False,
+                stop_after_cp6b=True,
+                exclude_keywords=exclude_keywords,
+                progress_callback=_progress,
+            )
+        persist_cp6b_run_result(client=client, run_id=run_id, result=result)
+    except Exception as e:
+        mark_run_failed(client, run_id, str(e))
+
+
+def process_notebook_upload_background(
+    run_id: str,
+    selected_ids: List[str],
+    nombre_notebook: Optional[str],
+    existing_notebook_id: Optional[str],
+    notebook_auth: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Crea/reutiliza notebook y sube la seleccion en background actualizando progreso."""
+    client = get_supabase_client()
+    attempted_document_ids: List[str] = []
+    try:
+        auth_seed = None
+        if notebook_auth is not None:
+            auth_seed = prepare_notebook_client_seed(notebook_auth)
+
+        run = load_run(client, run_id)
+        tipo = str(run.get("tipo") or "").strip()
+        id_documento = str(run.get("id_documento") or "")
+        if not tipo or not id_documento:
+            raise RuntimeError("La corrida CP6B no tiene tipo/id_documento validos.")
+
+        selected_rows = load_selected_documents(client, run_id, selected_ids)
+        total_docs = max(1, len(selected_rows))
+        create_new_notebook = bool(nombre_notebook)
+        notebook_name = normalize_optional_text(nombre_notebook) or str(
+            run.get("nombre_notebooklm") or existing_notebook_id or ""
+        )
+        if create_new_notebook and not notebook_name:
+            notebook_name = build_tipo_notebook_title(tipo, id_documento)
+
+        docs_for_upload = []
+        for row in selected_rows:
+            enriched_row = with_run_context(row, tipo=tipo)
+            ruta_relativa = str(row.get("ruta_relativa") or "")
+            docs_for_upload.append({
+                "document_id": str(row["id"]),
+                "nombre_archivo": str(
+                    row.get("nombre_archivo_final") or row.get("nombre_archivo") or ""
+                ),
+                "nombre_archivo_notebook": build_notebook_upload_filename(enriched_row),
+                "extension": str(row.get("extension") or ""),
+                "ruta_relativa": ruta_relativa,
+                "ruta_absoluta": resolve_document_path(
+                    str(run.get("output_dir") or ""),
+                    ruta_relativa,
+                ),
+                "tamano_bytes": to_int(row.get("tamano_bytes")),
+                "nivel_descarga_descompresion": to_int(
+                    row.get("nivel_descarga_descompresion")
+                ),
+                "origen": str(row.get("origen") or ""),
+            })
+
+        if create_new_notebook:
+            update_run_progress(client, run_id, {
+                "stage": "creating_notebook",
+                "current": 0,
+                "total": total_docs,
+                "message": "Creando notebook en NotebookLM.",
+            })
+            notebook_id, notebook_title_used, notebook_error = notify_notebook_api(
+                notebook_title=notebook_name,
+                api_base_url=NOTEBOOK_API_BASE_URL,
+                raise_on_error=True,
+                notebook_auth=notebook_auth,
+                auth_seed=auth_seed,
+            )
+            if not notebook_id:
+                raise NotebookAPIError(notebook_error or "No se obtuvo notebook_id.")
+        else:
+            notebook_id = str(existing_notebook_id or "").strip()
+            if not notebook_id:
+                raise RuntimeError("No se recibio notebook_id para reutilizar el notebook.")
+            notebook_title_used = notebook_name or notebook_id
+
+        client.table("adenda_document_runs").update({
+            "notebooklm_id": notebook_id,
+            "nombre_notebooklm": notebook_title_used,
+            "status": "uploading",
+            "progress_stage": "uploading",
+            "progress_current": 0,
+            "progress_total": total_docs,
+            "progress_percent": 0,
+            "progress_message": "Iniciando carga de documentos al notebook.",
+            "error_message": "",
+        }).eq("id", run_id).execute()
+
+        def _progress(payload: Dict[str, Any]) -> None:
+            update_run_progress(client, run_id, payload)
+
+        def _item_progress(event: str, item: Dict[str, Any], index: int, total: int) -> None:
+            document_id = str(item.get("document_id") or "").strip()
+            if not document_id:
+                return
+            if event == "completed":
+                attempted_document_ids.append(document_id)
+            if event == "starting":
+                update_document_upload_state(client, document_id, "uploading")
+            elif event == "completed":
+                update_document_upload_state(
+                    client,
+                    document_id,
+                    "uploaded" if item.get("uploaded") else "failed",
+                    "" if item.get("uploaded") else str(item.get("error") or ""),
+                )
+
+        upload_stats = upload_documents_batch_and_single(
+            notebook_id=notebook_id,
+            docs_report=docs_for_upload,
+            limit=NOTEBOOK_UPLOAD_LIMIT,
+            api_base_url=NOTEBOOK_API_BASE_URL,
+            progress_callback=_progress,
+            item_callback=_item_progress,
+            notebook_auth=notebook_auth,
+            auth_seed=auth_seed,
+        )
+
+        not_uploaded_ids = mark_remaining_documents_for_retry(
+            client=client,
+            run_id=run_id,
+            selected_ids=selected_ids,
+            attempted_document_ids=[item.get("document_id") for item in upload_stats.get("items", [])],
+            reason="Documento no fue intentado en esta corrida de carga; queda pendiente para reintento.",
+        )
+
+        retryable_count = to_int(upload_stats.get("uploaded_failed")) + len(not_uploaded_ids)
+        final_status = "success" if retryable_count == 0 else "partial_success"
+        final_total = max(1, len(selected_rows))
+        final_ok = to_int(upload_stats.get("uploaded_ok"))
+        final_failed = retryable_count
+        final_percent = 100 if final_total > 0 else 0
+        final_message = (
+            f"Carga finalizada: {final_ok} ok, {final_failed} con error."
+            if final_failed
+            else f"Carga finalizada: {final_ok} documentos subidos."
+        )
+        client.table("adenda_document_runs").update({
+            "status": final_status,
+            "notebooklm_id": notebook_id,
+            "nombre_notebooklm": notebook_title_used,
+            "progress_stage": final_status,
+            "progress_current": final_total,
+            "progress_total": final_total,
+            "progress_percent": final_percent,
+            "progress_message": final_message,
+            "error_message": "" if final_failed == 0 else str(run.get("error_message") or ""),
+        }).eq("id", run_id).execute()
+    except Exception as e:
+        mark_remaining_documents_for_retry(
+            client=client,
+            run_id=run_id,
+            selected_ids=selected_ids,
+            attempted_document_ids=attempted_document_ids,
+            reason=f"Carga interrumpida antes de completar el documento: {e}",
+        )
+        mark_run_failed(client, run_id, str(e))
+
+
+@app.get("/health")
+def health() -> dict:
+    """Healthcheck simple."""
+    return {"status": "ok"}
+
+
+@app.post(
+    "/api/v1/adenda/descarga-documentos-seia",
+    response_model=CreateCP6BResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_bearer_token)],
+)
+def create_adenda_cp6b_listing(
+    payload: CreateCP6BRequest,
+    background_tasks: BackgroundTasks,
+) -> CreateCP6BResponse:
+    """Encola la generacion del listado CP6B y responde inmediatamente con run_id."""
+    normalized_url = validate_documento_seia(payload.documento_seia)
+    tipo = validate_tipo(payload.tipo)
+    id_documento = extract_id_documento(normalized_url)
+    run_id = str(uuid.uuid4())
+    tipo_slug = "".join(ch if ch.isalnum() else "_" for ch in tipo).strip("_") or "tipo"
+    safe_doc_id = safe_id_documento_token(id_documento)
+    output_dir = API_OUTPUT_ROOT / f"{tipo_slug}_doc_{safe_doc_id}_cp6b_{run_id[:8]}"
+    exclude_keywords = [
+        str(keyword).strip()
+        for keyword in (payload.exclude_keywords or [])
+        if str(keyword).strip()
+    ]
+
+    try:
+        supabase = get_supabase_client()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
+
+    try:
+        create_cp6b_run_record(
+            client=supabase,
+            run_id=run_id,
+            tipo=tipo,
+            documento_seia=normalized_url,
+            id_documento=id_documento,
+            output_dir=str(output_dir),
+            exclude_keywords=exclude_keywords,
+        )
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudo crear la corrida CP6B: {e}",
+        ) from e
+
+    background_tasks.add_task(
+        process_cp6b_listing_background,
+        run_id,
+        tipo,
+        normalized_url,
+        str(output_dir),
+        exclude_keywords,
+    )
+
+    return CreateCP6BResponse(
+        status="queued",
+        run_id=run_id,
+        tipo=tipo,
+        id_documento=id_documento,
+        documents_found=0,
+        documents=[],
+    )
+
+
+@app.post(
+    "/api/v1/adenda/crear-y-cargar-notebook-filtrado",
+    response_model=UploadSelectionResponse,
+    status_code=status.HTTP_202_ACCEPTED,
+    dependencies=[Depends(require_bearer_token)],
+)
+def create_adenda_notebook_from_selection(
+    payload: UploadSelectionRequest,
+    background_tasks: BackgroundTasks,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> UploadSelectionResponse:
+    """Crea notebook y sube solo documentos seleccionados desde una corrida CP6B."""
+    selected_ids = [
+        doc_id.strip()
+        for doc_id in dict.fromkeys(payload.selected_document_ids)
+        if doc_id and doc_id.strip()
+    ]
+    nombre_notebook = normalize_optional_text(payload.nombre_notebook)
+    existing_notebook_id = normalize_optional_text(payload.notebook_id)
+
+    if not selected_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="selected_document_ids debe incluir al menos un documento.",
+        )
+    if bool(nombre_notebook) == bool(existing_notebook_id):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=(
+                "Debes enviar exactamente uno: nombre_notebook para crear un notebook nuevo, "
+                "o notebook_id para reutilizar uno existente."
+            ),
+        )
+
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, payload.run_id)
+        selected_rows = load_selected_documents(supabase, payload.run_id, selected_ids)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error leyendo seleccion desde Supabase: {e}",
+        ) from e
+
+    tipo = str(run.get("tipo") or "").strip()
+    id_documento = str(run.get("id_documento") or "")
+    if not tipo or not id_documento:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La corrida CP6B no tiene tipo/id_documento validos.",
+        )
+    create_new_notebook = bool(nombre_notebook)
+    notebook_name = nombre_notebook or str(run.get("nombre_notebooklm") or existing_notebook_id or "")
+    if create_new_notebook and not notebook_name:
+        notebook_name = build_tipo_notebook_title(tipo, id_documento)
+
+    selected_documents = []
+    for row in selected_rows:
+        enriched_row = with_run_context(row, tipo=tipo)
+        selected_documents.append(public_document_from_row(enriched_row, tipo=tipo))
+
+    try:
+        queue_notebook_upload_selection(
+            client=supabase,
+            run_id=payload.run_id,
+            selected_ids=selected_ids,
+            notebook_name=notebook_name,
+            existing_notebook_id=existing_notebook_id,
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudo encolar la carga al notebook: {e}",
+        ) from e
+
+    background_tasks.add_task(
+        process_notebook_upload_background,
+        payload.run_id,
+        selected_ids,
+        nombre_notebook,
+        existing_notebook_id,
+        notebook_auth,
+    )
+
+    notebook_id = str(existing_notebook_id or "")
+    notebook_title_used = notebook_name
+
+    return UploadSelectionResponse(
+        status="upload_queued",
+        run_id=payload.run_id,
+        tipo=tipo,
+        id_documento=id_documento,
+        notebooklm_id=notebook_id,
+        nombre_notebooklm=notebook_title_used,
+        documents_uploaded_ok=0,
+        documents_uploaded_failed=0,
+        retry_attempts=0,
+        retry_documents_count=0,
+        retry_document_ids=[],
+        selected_documents=selected_documents,
+    )
+
+
+@app.get(
+    "/api/v1/adenda/descarga-documentos-seia/{run_id}",
+    response_model=CP6BStatusResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def get_adenda_cp6b_status(run_id: str) -> CP6BStatusResponse:
+    """Retorna estado y documentos de una corrida CP6B."""
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, run_id)
+        run_tipo = str(run.get("tipo") or "")
+        run_rows = load_run_documents(supabase, run_id)
+        documents = [public_document_from_row(row, tipo=run_tipo) for row in run_rows]
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error leyendo estado CP6B: {e}",
+        ) from e
+
+    return CP6BStatusResponse(
+        status=str(run.get("status") or "queued"),
+        run_id=run_id,
+        tipo=str(run.get("tipo") or ""),
+        id_documento=str(run.get("id_documento") or ""),
+        documents_found=len(documents),
+        documents=documents,
+        progress_stage=str(run.get("progress_stage") or ""),
+        progress_current=to_int(run.get("progress_current")),
+        progress_total=to_int(run.get("progress_total")),
+        progress_percent=to_int(run.get("progress_percent")),
+        progress_message=str(run.get("progress_message") or ""),
+        error_message=str(run.get("error_message") or ""),
+        notebooklm_id=str(run.get("notebooklm_id") or ""),
+        nombre_notebooklm=str(run.get("nombre_notebooklm") or ""),
+        retry_attempts=get_run_retry_attempts(run),
+        retry_documents_count=len(retryable_document_ids(run_rows)),
+        retry_document_ids=retryable_document_ids(run_rows),
+    )
+
+
+@app.get(
+    "/api/v1/adenda/descarga-documentos-seia/{run_id}/documentos-fallidos.zip",
+    dependencies=[Depends(require_bearer_token)],
+)
+def download_retryable_documents_zip(run_id: str) -> FileResponse:
+    """Descarga un zip con los documentos seleccionados que siguen pendientes o fallidos."""
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, run_id)
+        retryable_rows = load_retryable_selected_documents(supabase, run_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error preparando descarga de documentos fallidos: {e}",
+        ) from e
+
+    if not retryable_rows:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No hay documentos pendientes/fallidos para descargar en esta corrida.",
+        )
+
+    zip_path = build_retry_documents_zip(run, retryable_rows)
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=zip_path.name,
+    )
+
+
+@app.post(
+    "/api/v1/adenda/descarga-documentos-seia/{run_id}/documentos-seleccionados.zip",
+    dependencies=[Depends(require_bearer_token)],
+)
+def download_selected_documents_zip(
+    run_id: str,
+    payload: DownloadSelectedDocumentsZipRequest,
+) -> FileResponse:
+    """Descarga un zip con documentos visibles usando nombre_para_notebook."""
+    selected_document_ids = [
+        str(document_id).strip()
+        for document_id in payload.selected_document_ids
+        if str(document_id).strip()
+    ]
+    if not selected_document_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Debes enviar al menos un document_id para descargar el zip.",
+        )
+
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, run_id)
+        selected_rows = load_selected_documents(supabase, run_id, selected_document_ids)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error preparando descarga de documentos visibles: {e}",
+        ) from e
+
+    zip_path = build_selected_documents_zip(run, selected_rows)
+    return FileResponse(
+        path=zip_path,
+        media_type="application/zip",
+        filename=zip_path.name,
+    )
+
+
+@app.post(
+    "/api/v1/adenda/reintentar-carga-notebook",
+    response_model=RetryUploadResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def retry_failed_notebook_upload(
+    payload: RetryUploadRequest,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> RetryUploadResponse:
+    """Reintenta subir al notebook documentos fallidos o no alcanzados ya seleccionados."""
+    auth_seed = None
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, payload.run_id)
+        if notebook_auth is not None:
+            auth_seed = prepare_notebook_client_seed(notebook_auth)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error leyendo corrida para reintento: {e}",
+        ) from e
+
+    notebook_id = str(run.get("notebooklm_id") or "")
+    if not notebook_id:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La corrida no tiene notebooklm_id; no se puede reintentar la carga.",
+        )
+
+    response = (
+        supabase.table("adenda_document_files")
+        .select("*")
+        .eq("run_id", payload.run_id)
+        .eq("selected", True)
+        .in_("upload_status", list(RETRYABLE_UPLOAD_STATUSES))
+        .execute()
+    )
+    failed_rows = supabase_data(response)
+    if not failed_rows:
+        return RetryUploadResponse(
+            status="no_failed_documents",
+            run_id=payload.run_id,
+            notebooklm_id=notebook_id,
+            documents_uploaded_ok=0,
+            documents_uploaded_failed=0,
+            retry_attempts=get_run_retry_attempts(run),
+            retry_documents_count=0,
+            retry_document_ids=[],
+            selected_documents=[],
+        )
+
+    retry_attempts = set_run_retry_attempts(
+        supabase,
+        payload.run_id,
+        run,
+        get_run_retry_attempts(run) + 1,
+    )
+
+    docs_for_upload = []
+    selected_documents = []
+    run_tipo = str(run.get("tipo") or "")
+    for row in failed_rows:
+        enriched_row = with_run_context(row, tipo=run_tipo)
+        ruta_relativa = str(row.get("ruta_relativa") or "")
+        docs_for_upload.append({
+            "document_id": str(row["id"]),
+            "nombre_archivo": str(row.get("nombre_archivo_final") or row.get("nombre_archivo") or ""),
+            "nombre_archivo_notebook": build_notebook_upload_filename(enriched_row),
+            "extension": str(row.get("extension") or ""),
+            "ruta_relativa": ruta_relativa,
+            "ruta_absoluta": resolve_document_path(str(run.get("output_dir") or ""), ruta_relativa),
+            "tamano_bytes": to_int(row.get("tamano_bytes")),
+            "nivel_descarga_descompresion": to_int(row.get("nivel_descarga_descompresion")),
+            "origen": str(row.get("origen") or ""),
+        })
+        selected_documents.append(public_document_from_row(enriched_row, tipo=run_tipo))
+
+    try:
+        for row in failed_rows:
+            update_document_upload_state(
+                supabase,
+                str(row["id"]),
+                "selected",
+                "",
+            )
+        upload_stats = upload_documents_batch_and_single(
+            notebook_id=notebook_id,
+            docs_report=docs_for_upload,
+            limit=None,
+            api_base_url=NOTEBOOK_API_BASE_URL,
+            notebook_auth=notebook_auth,
+            auth_seed=auth_seed,
+        )
+        not_uploaded_ids = mark_remaining_documents_for_retry(
+            client=supabase,
+            run_id=payload.run_id,
+            selected_ids=[str(row["id"]) for row in failed_rows],
+            attempted_document_ids=[item.get("document_id") for item in upload_stats.get("items", [])],
+            reason="Documento no fue intentado durante el reintento; queda pendiente para nueva carga.",
+        )
+        for item in upload_stats.get("items", []):
+            document_id = item.get("document_id")
+            if not document_id:
+                continue
+            supabase.table("adenda_document_files").update({
+                "upload_status": "uploaded" if item.get("uploaded") else "failed",
+                "upload_error": "" if item.get("uploaded") else str(item.get("error") or "")[:2000],
+            }).eq("id", document_id).execute()
+    except Exception as e:
+        mark_remaining_documents_for_retry(
+            client=supabase,
+            run_id=payload.run_id,
+            selected_ids=[str(row["id"]) for row in failed_rows],
+            attempted_document_ids=[],
+            reason=f"Reintento interrumpido antes de completar la carga: {e}",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error reintentando carga de notebook: {e}",
+        ) from e
+
+    remaining_rows = load_run_documents(supabase, payload.run_id)
+    retry_ids = retryable_document_ids([row for row in remaining_rows if bool(row.get("selected"))])
+    retry_status = "success" if not retry_ids else "partial_success"
+    return RetryUploadResponse(
+        status=retry_status,
+        run_id=payload.run_id,
+        notebooklm_id=notebook_id,
+        documents_uploaded_ok=upload_stats["uploaded_ok"],
+        documents_uploaded_failed=len(retry_ids),
+        retry_attempts=retry_attempts,
+        retry_documents_count=len(retry_ids),
+        retry_document_ids=retry_ids,
+        selected_documents=selected_documents,
+    )
+
+
+@app.post(
+    "/api/v1/adendas/notebooklm",
+    response_model=CreateNotebookResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def create_adenda_notebook(
+    payload: CreateNotebookRequest,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> CreateNotebookResponse:
+    """Endpoint principal para crear notebook y persistirlo en adendas."""
+    normalized_url = validate_documento_seia(payload.documento_seia)
+    id_documento = extract_id_documento(normalized_url)
+    notebook_name = build_adenda_notebook_title(payload.id_adenda, id_documento)
+    safe_doc_id = safe_id_documento_token(id_documento)
+    output_dir = API_OUTPUT_ROOT / f"adenda_{payload.id_adenda}_doc_{safe_doc_id}_{notebook_name.split('_')[-1]}"
+
+    try:
+        supabase = get_supabase_client()
+    except Exception as e:
+        raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(e)) from e
+
+    try:
+        if not adenda_exists(supabase, payload.id_adenda):
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"No existe adenda con id={payload.id_adenda}",
+            )
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error validando adenda en Supabase: {e}",
+        ) from e
+
+    def on_notebook_created(notebook_id: str, notebook_title: str) -> None:
+        try:
+            persist_adenda_notebook(
+                client=supabase,
+                id_adenda=payload.id_adenda,
+                notebook_id=notebook_id,
+                notebook_name=notebook_title,
+            )
+        except Exception as e:
+            raise RuntimeError(f"No se pudo guardar notebook en Supabase: {e}") from e
+
+    try:
+        with _JOB_SEMAPHORE:
+            result = run_seia_notebook_pipeline(
+                documento_seia=normalized_url,
+                id_adenda=payload.id_adenda,
+                output_dir=output_dir,
+                output_base_dir=API_OUTPUT_ROOT,
+                skip_size_estimation=False,
+                no_extract=False,
+                keep_existing=False,
+                enable_download=True,
+                upload_limit=NOTEBOOK_UPLOAD_LIMIT,
+                notebook_title=notebook_name,
+                notebook_api_base_url=NOTEBOOK_API_BASE_URL,
+                require_notebook=True,
+                on_notebook_created=on_notebook_created,
+                notebook_auth=notebook_auth,
+            )
+    except NotebookAPIError as e:
+        raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
+    except HTTPException:
+        raise
+    except RuntimeError as e:
+        message = str(e)
+        if "No se encontraron documentos descargables" in message:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=message,
+            ) from e
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=message,
+        ) from e
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error interno procesando solicitud: {e}",
+        ) from e
+
+    return CreateNotebookResponse(
+        status=result["status"],
+        id_adenda=payload.id_adenda,
+        id_documento=result["id_documento"],
+        notebooklm_id=result["notebooklm_id"],
+        nombre_notebooklm=result["nombre_notebooklm"],
+        documents_found=result["documents_found"],
+        documents_uploaded_ok=result["documents_uploaded_ok"],
+        documents_uploaded_failed=result["documents_uploaded_failed"],
+        output_dir=result["output_dir"],
+        elapsed_seconds=result["elapsed_seconds"],
+    )
+
+
+@app.get(
+    "/notebooks/{notebook_id}/share",
+    dependencies=[Depends(require_bearer_token)],
+)
+def get_share_status(
+    notebook_id: str,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Retorna configuracion de sharing y colaboradores del notebook."""
+    async def _op(client: NotebookLMClient):
+        return await client.sharing.get_status(notebook_id)
+
+    share_status = run_notebook_share_operation(notebook_auth, _op)
+    return {"ok": True, "item": _share_status_payload(share_status)}
+
+
+@app.post(
+    "/notebooks/{notebook_id}/share/public",
+    dependencies=[Depends(require_bearer_token)],
+)
+def set_public_share(
+    notebook_id: str,
+    body: ShareSetPublicRequest,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Habilita o deshabilita sharing publico del notebook."""
+    async def _op(client: NotebookLMClient):
+        return await client.sharing.set_public(notebook_id, body.public)
+
+    share_status = run_notebook_share_operation(notebook_auth, _op)
+    return {"ok": True, "item": _share_status_payload(share_status)}
+
+
+@app.post(
+    "/notebooks/{notebook_id}/share/view-level",
+    dependencies=[Depends(require_bearer_token)],
+)
+def set_share_view_level(
+    notebook_id: str,
+    body: ShareSetViewLevelRequest,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Define scope de viewers (full_notebook o chat_only)."""
+    view_level = _parse_share_view_level(body.view_level)
+
+    async def _op(client: NotebookLMClient):
+        return await client.sharing.set_view_level(notebook_id, view_level)
+
+    share_status = run_notebook_share_operation(notebook_auth, _op)
+    return {"ok": True, "item": _share_status_payload(share_status)}
+
+
+@app.post(
+    "/notebooks/{notebook_id}/share/users",
+    dependencies=[Depends(require_bearer_token)],
+)
+def add_share_user(
+    notebook_id: str,
+    body: ShareAddUserRequest,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Comparte notebook con un usuario como viewer/editor."""
+    email = _validate_email(body.email)
+    permission = _parse_share_permission(body.permission)
+
+    async def _op(client: NotebookLMClient):
+        return await client.sharing.add_user(
+            notebook_id,
+            email,
+            permission=permission,
+            notify=body.notify,
+            welcome_message=body.welcome_message,
+        )
+
+    share_status = run_notebook_share_operation(notebook_auth, _op)
+    return {"ok": True, "item": _share_status_payload(share_status)}
+
+
+@app.patch(
+    "/notebooks/{notebook_id}/share/users/{email}",
+    dependencies=[Depends(require_bearer_token)],
+)
+def update_share_user(
+    notebook_id: str,
+    email: str,
+    body: ShareUpdateUserRequest,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Actualiza permiso de un usuario ya compartido."""
+    valid_email = _validate_email(email)
+    permission = _parse_share_permission(body.permission)
+
+    async def _op(client: NotebookLMClient):
+        return await client.sharing.update_user(
+            notebook_id,
+            valid_email,
+            permission=permission,
+        )
+
+    share_status = run_notebook_share_operation(notebook_auth, _op)
+    return {"ok": True, "item": _share_status_payload(share_status)}
+
+
+@app.delete(
+    "/notebooks/{notebook_id}/share/users/{email}",
+    dependencies=[Depends(require_bearer_token)],
+)
+def remove_share_user(
+    notebook_id: str,
+    email: str,
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Revoca acceso compartido de un usuario."""
+    valid_email = _validate_email(email)
+
+    async def _op(client: NotebookLMClient):
+        return await client.sharing.remove_user(notebook_id, valid_email)
+
+    share_status = run_notebook_share_operation(notebook_auth, _op)
+    return {"ok": True, "item": _share_status_payload(share_status)}
