@@ -9,8 +9,7 @@ Este directorio contiene los artefactos de despliegue para la VM Linux existente
 ├── docker-compose.yml
 ├── .env
 └── repos/
-    ├── documentos-seia/
-    └── notebooklm/
+    └── documentos-seia/
 ```
 
 Persistencia:
@@ -25,7 +24,6 @@ Persistencia:
 sudo apt update
 sudo apt install -y docker.io docker-compose-plugin nginx python3-certbot-nginx
 sudo mkdir -p /opt/documentos-seia-notebook/repos/documentos-seia
-sudo mkdir -p /opt/documentos-seia-notebook/repos/notebooklm
 sudo mkdir -p /var/lib/documentos-seia-notebook/downloads
 sudo chown -R "$USER":"$USER" /opt/documentos-seia-notebook /var/lib/documentos-seia-notebook
 ```
@@ -35,7 +33,6 @@ sudo chown -R "$USER":"$USER" /opt/documentos-seia-notebook /var/lib/documentos-
 - Copiar `docker-compose.yml` a `/opt/documentos-seia-notebook/docker-compose.yml`
 - Copiar `.env.example` como `/opt/documentos-seia-notebook/.env` y completar secretos reales
 - Copiar el repo actual a `/opt/documentos-seia-notebook/repos/documentos-seia/`
-- Copiar `NotebookLM/` a `/opt/documentos-seia-notebook/repos/notebooklm/`
 
 ## Nginx del host
 
@@ -68,5 +65,5 @@ docker compose ps
 
 ```bash
 curl http://127.0.0.1:8020/health
-docker compose exec documentos-seia-api curl -fsS http://notebooklm-api:8001/health
+docker compose ps
 ```

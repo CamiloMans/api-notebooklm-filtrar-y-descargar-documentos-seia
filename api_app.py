@@ -92,6 +92,8 @@ def parse_cors_origins(raw_value: str) -> List[str]:
     origins = []
     for item in (raw_value or "").split(","):
         value = item.strip()
+        if value.endswith("/"):
+            value = value.rstrip("/")
         if value:
             origins.append(value)
     return origins
