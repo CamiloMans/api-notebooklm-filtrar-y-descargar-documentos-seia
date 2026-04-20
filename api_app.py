@@ -27,7 +27,7 @@ from notebooklm import (
     SharePermission,
     ShareViewLevel,
 )
-from notebooklm.auth import fetch_tokens
+from notebooklm.auth import MINIMUM_REQUIRED_COOKIES, _is_allowed_auth_domain, fetch_tokens
 
 try:
     from dotenv import load_dotenv
@@ -294,6 +294,14 @@ class ShareUpdateUserRequest(BaseModel):
     permission: Literal["viewer", "editor"] = Field(..., description="Nuevo nivel de permiso.")
 
 
+class ValidateCookiesRequest(BaseModel):
+    cookies_text: str = Field(
+        ...,
+        min_length=1,
+        description="Cookies Netscape o storage JSON de Playwright para autenticar NotebookLM.",
+    )
+
+
 app = FastAPI(
     title="SEIA Notebook API",
     version="1.0.0",
@@ -334,6 +342,14 @@ def require_bearer_token(authorization: Optional[str] = Header(default=None)) ->
             headers={"WWW-Authenticate": "Bearer"},
         )
 
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or token.strip() != API_BEARER_TOKEN:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Unauthorized",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
 
 def get_notebook_auth_payload(
     x_notebooklm_auth: Optional[str] = Header(default=None, alias=NOTEBOOK_AUTH_HEADER),
@@ -349,14 +365,6 @@ def get_notebook_auth_payload(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=str(exc),
         ) from exc
-
-    scheme, _, token = authorization.partition(" ")
-    if scheme.lower() != "bearer" or token.strip() != API_BEARER_TOKEN:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Unauthorized",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
 
 
 def _parse_share_permission(value: str) -> SharePermission:
@@ -467,6 +475,133 @@ def run_notebook_share_operation(
         raise
     except Exception as exc:  # noqa: BLE001
         raise _map_notebook_share_exception(exc) from exc
+
+
+def _parse_netscape_cookies_text(raw_text: str) -> Dict[str, Any]:
+    """Convierte cookies Netscape a un storage state compatible con Playwright."""
+    cookies: List[Dict[str, Any]] = []
+
+    for raw_line in raw_text.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        http_only = False
+        if line.startswith("#HttpOnly_"):
+            http_only = True
+            line = line[len("#HttpOnly_") :]
+        elif line.startswith("#"):
+            continue
+
+        parts = line.split("\t")
+        if len(parts) != 7:
+            continue
+
+        domain, include_subdomains, cookie_path, secure_flag, expires, name, value = parts
+        normalized_domain = domain.strip()
+        if not normalized_domain or not str(name).strip():
+            continue
+
+        try:
+            expires_value = int(str(expires).strip())
+        except (TypeError, ValueError):
+            expires_value = -1
+
+        cookies.append(
+            {
+                "name": str(name).strip(),
+                "value": str(value),
+                "domain": normalized_domain,
+                "path": cookie_path.strip() or "/",
+                "expires": expires_value,
+                "httpOnly": http_only,
+                "secure": secure_flag.strip().upper() == "TRUE",
+                "sameSite": "Lax",
+                "includeSubdomains": include_subdomains.strip().upper() == "TRUE",
+            }
+        )
+
+    return {"cookies": cookies, "origins": []}
+
+
+def _normalize_storage_state_from_text(raw_text: str) -> tuple[Dict[str, Any], str]:
+    """Detecta el formato pegado y lo normaliza a storage state."""
+    cleaned_text = (raw_text or "").strip()
+    if not cleaned_text:
+        raise ValueError("Debes pegar cookies antes de validarlas.")
+
+    try:
+        parsed_json = json.loads(cleaned_text)
+    except json.JSONDecodeError:
+        storage_state = _parse_netscape_cookies_text(cleaned_text)
+        if not storage_state["cookies"]:
+            raise ValueError(
+                "No se pudo interpretar el texto pegado como cookies Netscape ni como storage JSON."
+            ) from None
+        return storage_state, "netscape_text"
+
+    if isinstance(parsed_json, dict) and isinstance(parsed_json.get("cookies"), list):
+        return {
+            "cookies": list(parsed_json.get("cookies") or []),
+            "origins": list(parsed_json.get("origins") or []),
+        }, "playwright_storage_json"
+
+    raise ValueError(
+        "El JSON pegado no tiene formato valido. Se esperaba un storage state con la clave 'cookies'."
+    )
+
+
+def _select_auth_cookies_from_storage(
+    storage_state: Dict[str, Any],
+) -> tuple[Dict[str, str], Dict[str, str], List[str]]:
+    """Selecciona cookies utiles para NotebookLM respetando dominios admitidos."""
+    cookies: Dict[str, str] = {}
+    cookie_domains: Dict[str, str] = {}
+
+    for cookie in storage_state.get("cookies", []):
+        if not isinstance(cookie, dict):
+            continue
+
+        domain = str(cookie.get("domain", "")).strip()
+        name = str(cookie.get("name", "")).strip()
+        value = str(cookie.get("value", ""))
+        if not _is_allowed_auth_domain(domain) or not name or not value:
+            continue
+
+        is_base_domain = domain == ".google.com"
+        if name not in cookies or is_base_domain:
+            cookies[name] = value
+            cookie_domains[name] = domain
+
+    missing_required = sorted(MINIMUM_REQUIRED_COOKIES - set(cookies.keys()))
+    return cookies, cookie_domains, missing_required
+
+
+def _allowed_cookie_domains_from_storage(storage_state: Dict[str, Any]) -> List[str]:
+    """Retorna dominios Google validos presentes en las cookies pegadas."""
+    domains = {
+        str(cookie.get("domain", "")).strip()
+        for cookie in storage_state.get("cookies", [])
+        if isinstance(cookie, dict)
+        and _is_allowed_auth_domain(str(cookie.get("domain", "")).strip())
+    }
+    return sorted(domain for domain in domains if domain)
+
+
+def _build_compact_auth_payload_from_storage(
+    storage_state: Dict[str, Any],
+) -> tuple[Dict[str, Any], List[str]]:
+    """Genera el payload compacto que la UI guarda y reenvia por header."""
+    cookies, cookie_domains_by_name, missing_required = _select_auth_cookies_from_storage(
+        storage_state
+    )
+    payload = {
+        "version": 1,
+        "cookies": cookies,
+        "cookie_names": sorted(cookies.keys()),
+        "cookie_domains": sorted(set(cookie_domains_by_name.values())),
+    }
+    return payload, missing_required
 
 
 def validate_documento_seia(documento_seia: str) -> str:
@@ -1334,6 +1469,74 @@ def process_notebook_upload_background(
 def health() -> dict:
     """Healthcheck simple."""
     return {"status": "ok"}
+
+
+@app.post(
+    "/auth/validate-cookies",
+    dependencies=[Depends(require_bearer_token)],
+)
+def validate_cookies(body: ValidateCookiesRequest) -> Dict[str, Any]:
+    """Valida cookies pegadas por el usuario y devuelve auth compacta reutilizable."""
+    try:
+        storage_state, format_detected = _normalize_storage_state_from_text(body.cookies_text)
+        auth_payload, missing_required = _build_compact_auth_payload_from_storage(storage_state)
+        cookie_domains = _allowed_cookie_domains_from_storage(storage_state)
+
+        if missing_required:
+            return {
+                "ok": False,
+                "message": (
+                    "Faltan cookies obligatorias para autenticar en NotebookLM: "
+                    + ", ".join(missing_required)
+                ),
+                "format_detected": format_detected,
+                "cookie_domains": cookie_domains,
+                "selected_cookie_names": auth_payload["cookie_names"],
+                "missing_required_cookies": missing_required,
+                "token_fetch_ok": False,
+                "auth_payload": None,
+            }
+
+        asyncio.run(fetch_tokens(dict(auth_payload["cookies"])))
+        return {
+            "ok": True,
+            "message": "Cookies validas para NotebookLM.",
+            "format_detected": format_detected,
+            "cookie_domains": cookie_domains,
+            "selected_cookie_names": auth_payload["cookie_names"],
+            "missing_required_cookies": [],
+            "token_fetch_ok": True,
+            "auth_payload": auth_payload,
+        }
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc).strip() or "No se pudieron validar las cookies."
+        return {
+            "ok": False,
+            "message": message,
+            "format_detected": "unknown",
+            "cookie_domains": [],
+            "selected_cookie_names": [],
+            "missing_required_cookies": [],
+            "token_fetch_ok": False,
+            "auth_payload": None,
+        }
+
+
+@app.get(
+    "/notebooks",
+    dependencies=[Depends(require_bearer_token)],
+)
+def list_notebooks(
+    notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
+) -> Dict[str, Any]:
+    """Lista notebooks de la cuenta autenticada via X-NotebookLM-Auth."""
+
+    async def _op(client: NotebookLMClient):
+        return await client.notebooks.list()
+
+    notebooks = run_notebook_share_operation(notebook_auth, _op, timeout=30.0)
+    payload = [{"id": notebook.id, "title": notebook.title} for notebook in notebooks]
+    return {"ok": True, "items": payload}
 
 
 @app.post(
