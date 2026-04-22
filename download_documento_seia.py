@@ -100,14 +100,14 @@ NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC = int(
 NOTEBOOK_UPLOAD_LIMIT = None
 NOTEBOOK_UPLOAD_MAX_WORKERS = max(
     1,
-    int(os.getenv("NOTEBOOK_UPLOAD_MAX_WORKERS", "2") or "2"),
+    int(os.getenv("NOTEBOOK_UPLOAD_MAX_WORKERS", "1") or "1"),
 )
 NOTEBOOK_UPLOAD_RETRY_ATTEMPTS = max(
     1,
-    int(os.getenv("NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", "3") or "3"),
+    int(os.getenv("NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", "5") or "5"),
 )
 NOTEBOOK_UPLOAD_RETRY_BASE_SEC = float(
-    os.getenv("NOTEBOOK_UPLOAD_RETRY_BASE_SEC", "2") or "2"
+    os.getenv("NOTEBOOK_UPLOAD_RETRY_BASE_SEC", "5") or "5"
 )
 NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC = float(
     os.getenv("NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC", "0.6") or "0.6"
@@ -1982,7 +1982,8 @@ def build_notebook_upload_filename(item):
     normalized = unicodedata.normalize("NFKD", normalized)
     normalized = normalized.encode("ascii", "ignore").decode("ascii")
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    normalized = re.sub(r"[ _]+", "_", normalized)
+    normalized = normalized.replace(".", "_")
+    normalized = re.sub(r"[ _]+", "_", normalized).strip("_")
     if not normalized:
         normalized = "archivo"
     return normalized + ext
