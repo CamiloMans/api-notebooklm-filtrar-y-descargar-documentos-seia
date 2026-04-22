@@ -43,6 +43,7 @@ from notebooklm import (
     NotebookLMClient,
     AuthError,
     RPCError,
+    SourceAddError,
     SourceProcessingError,
     SourceTimeoutError,
     ValidationError,
@@ -2603,10 +2604,12 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     if not _path_exists(p):
         return {**base_item, "error": f"No existe archivo: {p}", "attempts": 0}
 
+    current_seed = auth_seed
+
     async def _upload():
         async with await _create_notebook_client_async(
             notebook_auth=notebook_auth,
-            auth_seed=auth_seed,
+            auth_seed=current_seed,
             timeout=NOTEBOOK_CLIENT_TIMEOUT_SEC,
         ) as client:
             source = await client.sources.add_file(
@@ -2629,6 +2632,17 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
                         f"'{upload_name}': {_notebooklm_error_message(rename_exc)}"
                     )
         return source, warning
+
+    async def _refresh_tokens():
+        cookies = (current_seed or {}).get("cookies") or {}
+        if not cookies:
+            return None
+        new_csrf, new_sess = await fetch_tokens(dict(cookies))
+        return {
+            **(current_seed or {}),
+            "csrf_token": new_csrf,
+            "session_id": new_sess,
+        }
 
     started = time.perf_counter()
     last_error = None
@@ -2657,6 +2671,7 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
             if status_code != 429 and status_code < 500:
                 break
         except (
+            SourceAddError,
             SourceTimeoutError,
             SourceProcessingError,
             httpx.TimeoutException,
@@ -2667,12 +2682,21 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
             last_error = e
 
         if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
+            refresh_note = ""
+            if isinstance(last_error, SourceAddError) or "SOURCE_ID" in str(last_error):
+                try:
+                    refreshed = asyncio.run(_refresh_tokens())
+                    if refreshed:
+                        current_seed = refreshed
+                        refresh_note = " [tokens refrescados]"
+                except Exception as refresh_exc:
+                    refresh_note = f" [refresh tokens fallo: {type(refresh_exc).__name__}]"
             sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
             sleep_s += random.uniform(0, 0.5)
             print(
                 f"      Reintento {attempt}/{NOTEBOOK_UPLOAD_RETRY_ATTEMPTS - 1} "
                 f"de {console_safe(upload_name)} en {round(sleep_s, 2)}s "
-                f"(motivo: {type(last_error).__name__})"
+                f"(motivo: {type(last_error).__name__}){refresh_note}"
             )
             time.sleep(sleep_s)
 
