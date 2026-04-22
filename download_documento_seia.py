@@ -17,6 +17,7 @@ import hashlib
 import json
 import mimetypes
 import os
+import random
 import re
 import sys
 import time
@@ -33,6 +34,7 @@ import zipfile
 
 import asyncio
 
+import httpx
 import requests
 from bs4 import BeautifulSoup
 
@@ -43,6 +45,7 @@ from notebooklm import (
     RPCError,
     SourceProcessingError,
     SourceTimeoutError,
+    ValidationError,
 )
 from notebooklm.auth import fetch_tokens
 from notebooklm.types import source_status_to_str
@@ -91,11 +94,23 @@ ENABLE_DOWNLOAD = True
 ENABLE_NOTEBOOK_SYNC = True
 
 NOTEBOOK_CLIENT_TIMEOUT_SEC = 120
-NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC = 300
+NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC = int(
+    os.getenv("NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC", "600") or "600"
+)
 NOTEBOOK_UPLOAD_LIMIT = None
 NOTEBOOK_UPLOAD_MAX_WORKERS = max(
     1,
-    int(os.getenv("NOTEBOOK_UPLOAD_MAX_WORKERS", "4") or "4"),
+    int(os.getenv("NOTEBOOK_UPLOAD_MAX_WORKERS", "2") or "2"),
+)
+NOTEBOOK_UPLOAD_RETRY_ATTEMPTS = max(
+    1,
+    int(os.getenv("NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", "3") or "3"),
+)
+NOTEBOOK_UPLOAD_RETRY_BASE_SEC = float(
+    os.getenv("NOTEBOOK_UPLOAD_RETRY_BASE_SEC", "2") or "2"
+)
+NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC = float(
+    os.getenv("NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC", "0.6") or "0.6"
 )
 
 USER_AGENT = (
@@ -2585,55 +2600,91 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     }
 
     if not _path_exists(p):
-        return {**base_item, "error": f"No existe archivo: {p}"}
+        return {**base_item, "error": f"No existe archivo: {p}", "attempts": 0}
+
+    async def _upload():
+        async with await _create_notebook_client_async(
+            notebook_auth=notebook_auth,
+            auth_seed=auth_seed,
+            timeout=NOTEBOOK_CLIENT_TIMEOUT_SEC,
+        ) as client:
+            source = await client.sources.add_file(
+                notebook_id,
+                _long_path(p),
+                wait=True,
+                wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
+            )
+            warning = None
+            if upload_name and source.title != upload_name:
+                try:
+                    source = await client.sources.rename(
+                        notebook_id,
+                        source.id,
+                        upload_name,
+                    )
+                except Exception as rename_exc:
+                    warning = (
+                        f"Source subido pero no se pudo renombrar a "
+                        f"'{upload_name}': {_notebooklm_error_message(rename_exc)}"
+                    )
+        return source, warning
 
     started = time.perf_counter()
-    try:
-        async def _upload():
-            async with await _create_notebook_client_async(
-                notebook_auth=notebook_auth,
-                auth_seed=auth_seed,
-                timeout=NOTEBOOK_CLIENT_TIMEOUT_SEC,
-            ) as client:
-                source = await client.sources.add_file(
-                    notebook_id,
-                    _long_path(p),
-                    wait=True,
-                    wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
-                )
-                warning = None
-                if upload_name and source.title != upload_name:
-                    try:
-                        source = await client.sources.rename(
-                            notebook_id,
-                            source.id,
-                            upload_name,
-                        )
-                    except Exception as rename_exc:
-                        warning = (
-                            f"Source subido pero no se pudo renombrar a "
-                            f"'{upload_name}': {_notebooklm_error_message(rename_exc)}"
-                        )
-            return source, warning
+    last_error = None
+    attempts_done = 0
+    for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
+        attempts_done = attempt
+        try:
+            source, warning = asyncio.run(_upload())
+            elapsed = time.perf_counter() - started
+            return {
+                **base_item,
+                "status_code": 200,
+                "uploaded": True,
+                "error": None,
+                "warning": warning,
+                "response_body": {"ok": True, "item": _source_payload(source)},
+                "elapsed_seconds": round(elapsed, 2),
+                "attempts": attempts_done,
+            }
+        except (FileNotFoundError, ValidationError, AuthError) as e:
+            last_error = e
+            break
+        except httpx.HTTPStatusError as e:
+            last_error = e
+            status_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
+            if status_code != 429 and status_code < 500:
+                break
+        except (
+            SourceTimeoutError,
+            SourceProcessingError,
+            httpx.TimeoutException,
+            httpx.TransportError,
+        ) as e:
+            last_error = e
+        except Exception as e:
+            last_error = e
 
-        source, warning = asyncio.run(_upload())
-        elapsed = time.perf_counter() - started
-        return {
-            **base_item,
-            "status_code": 200,
-            "uploaded": True,
-            "error": None,
-            "warning": warning,
-            "response_body": {"ok": True, "item": _source_payload(source)},
-            "elapsed_seconds": round(elapsed, 2),
-        }
-    except Exception as e:
-        elapsed = time.perf_counter() - started
-        return {
-            **base_item,
-            "error": _notebooklm_error_message(e),
-            "elapsed_seconds": round(elapsed, 2),
-        }
+        if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
+            sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
+            sleep_s += random.uniform(0, 0.5)
+            print(
+                f"      Reintento {attempt}/{NOTEBOOK_UPLOAD_RETRY_ATTEMPTS - 1} "
+                f"de {console_safe(upload_name)} en {round(sleep_s, 2)}s "
+                f"(motivo: {type(last_error).__name__})"
+            )
+            time.sleep(sleep_s)
+
+    elapsed = time.perf_counter() - started
+    error_msg = _notebooklm_error_message(last_error) if last_error else "Error desconocido"
+    if attempts_done > 1:
+        error_msg = f"{error_msg} [tras {attempts_done} intentos]"
+    return {
+        **base_item,
+        "error": error_msg,
+        "elapsed_seconds": round(elapsed, 2),
+        "attempts": attempts_done,
+    }
 
 
 def upload_documents_batch_and_single(
@@ -2728,6 +2779,8 @@ def upload_documents_batch_and_single(
         except StopIteration:
             return
         _notify_start(order, doc)
+        if NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC > 0:
+            time.sleep(random.uniform(0, NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC))
         future = executor.submit(
             _upload_single_document,
             notebook_id,
