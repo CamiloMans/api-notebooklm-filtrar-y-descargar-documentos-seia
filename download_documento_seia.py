@@ -98,7 +98,36 @@ NOTEBOOK_CLIENT_TIMEOUT_SEC = 120
 NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC = int(
     os.getenv("NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC", "600") or "600"
 )
-NOTEBOOK_UPLOAD_LIMIT = None
+
+
+def _getenv_non_negative_int(name: str, default: int) -> int:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed_value = int(raw_value)
+    except ValueError:
+        return default
+    return max(0, parsed_value)
+
+
+def _getenv_optional_positive_int(name: str, default: int | None) -> int | None:
+    raw_value = os.getenv(name)
+    if raw_value is None or not raw_value.strip():
+        return default
+    try:
+        parsed_value = int(raw_value.strip())
+    except ValueError:
+        return default
+    return parsed_value if parsed_value > 0 else None
+
+
+NOTEBOOK_SOURCES_PER_NOTEBOOK = _getenv_non_negative_int(
+    "NOTEBOOK_SOURCES_PER_NOTEBOOK",
+    300,
+)
+NOTEBOOK_UPLOAD_LIMIT = _getenv_optional_positive_int(
+    "NOTEBOOK_UPLOAD_LIMIT",
+    NOTEBOOK_SOURCES_PER_NOTEBOOK or None,
+)
 NOTEBOOK_UPLOAD_MAX_WORKERS = max(
     1,
     int(os.getenv("NOTEBOOK_UPLOAD_MAX_WORKERS", "1") or "1"),

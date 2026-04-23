@@ -150,7 +150,9 @@ Notas:
 - Durante la carga, `progress_stage` avanza por `upload_queued`, `creating_notebook` y `uploading`.
 - Cuando termina la carga, el `GET` tambien devuelve `retry_attempts`, `retry_document_ids` y `retry_documents_count` con los documentos que fallaron o no alcanzaron a intentarse.
 - La API de NotebookLM actual expone una subida por archivo, asi que este proyecto acelera la carga usando varias subidas individuales en paralelo.
-- Puedes ajustar ese paralelismo con `NOTEBOOK_UPLOAD_MAX_WORKERS` en `.env`. El valor por defecto actual es `4`.
+- Por defecto se valida un maximo de `300` fuentes por notebook (`NOTEBOOK_SOURCES_PER_NOTEBOOK=300`) para cuentas NotebookLM Pro.
+- Si la cuenta usa Standard, Plus o Ultra, ajusta `NOTEBOOK_SOURCES_PER_NOTEBOOK` y, si corresponde, `NOTEBOOK_UPLOAD_LIMIT` en `.env`.
+- Puedes ajustar el paralelismo con `NOTEBOOK_UPLOAD_MAX_WORKERS` en `.env`. El valor recomendado en la VM `e2-micro` es `1`.
 
 Response:
 
@@ -220,7 +222,46 @@ Comportamiento:
 - Usa `nombre_para_notebook` como nombre del archivo dentro del ZIP.
 - Incluye un `LEEME.txt` con el contexto de la corrida.
 
-## 7. Endpoint legacy
+## 7. Descargar zip de documentos visibles por partes
+
+Para descargas grandes desde `app.myma.cl`, usar el flujo por partes para evitar limites del proxy.
+
+`POST /api/v1/adenda/descarga-documentos-seia/{run_id}/documentos-seleccionados/export`
+
+Request:
+
+```json
+{
+  "selected_document_ids": [
+    "uuid-documento-1",
+    "uuid-documento-2"
+  ]
+}
+```
+
+Response:
+
+```json
+{
+  "export_id": "hash-seleccion",
+  "filename": "documentos_para_notebook_corrida_hash.zip",
+  "size_bytes": 144419790,
+  "part_size_bytes": 8388608,
+  "parts": 18
+}
+```
+
+Luego descargar cada parte:
+
+`GET /api/v1/adenda/descarga-documentos-seia/{run_id}/documentos-seleccionados/export/{export_id}/part/{part_index}`
+
+Comportamiento:
+
+- `part_index` empieza en `0`.
+- Cada respuesta incluye `Content-Range`, `X-Zip-Part-Count`, `X-Zip-Part-Index` y `X-Zip-Filename`.
+- El frontend debe concatenar las partes en orden para reconstruir el mismo `.zip`.
+
+## 8. Endpoint legacy
 
 `POST /api/v1/adendas/notebooklm`
 

@@ -4,6 +4,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import os
 import threading
@@ -15,7 +16,7 @@ from urllib.parse import urlparse
 
 from fastapi import BackgroundTasks, Depends, FastAPI, Header, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel, Field
 from supabase import Client, create_client
 
@@ -36,6 +37,7 @@ except ImportError:
 
 from download_documento_seia import (
     DEFAULT_OUTPUT,
+    NOTEBOOK_SOURCES_PER_NOTEBOOK,
     NOTEBOOK_UPLOAD_LIMIT,
     NotebookAPIError,
     _long_path,
@@ -46,6 +48,7 @@ from download_documento_seia import (
     compact_component,
     extract_id_documento,
     force_https,
+    list_notebook_sources,
     notify_notebook_api,
     prepare_notebook_client_seed,
     run_seia_notebook_pipeline,
@@ -85,6 +88,56 @@ _SUPABASE_CLIENT: Optional[Client] = None
 _JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
 RETRYABLE_UPLOAD_STATUSES = ("failed", "not_uploaded", "selected", "uploading", "pending")
 NOTEBOOK_AUTH_HEADER = "X-NotebookLM-Auth"
+ZIP_EXPORT_PART_SIZE_BYTES = getenv_positive_int("ZIP_EXPORT_PART_SIZE_BYTES", 8 * 1024 * 1024)
+
+
+def validate_notebook_source_capacity(
+    document_count: int,
+    *,
+    notebook_id: Optional[str] = None,
+    notebook_auth: Optional[Dict[str, Any]] = None,
+    auth_seed: Optional[Dict[str, Any]] = None,
+) -> None:
+    """Evita cargas que exceden el limite de fuentes de NotebookLM por notebook."""
+    if NOTEBOOK_SOURCES_PER_NOTEBOOK <= 0 or document_count <= 0:
+        return
+
+    current_sources = 0
+    normalized_notebook_id = (notebook_id or "").strip()
+    if normalized_notebook_id:
+        try:
+            current_sources = len(
+                list_notebook_sources(
+                    normalized_notebook_id,
+                    api_base_url=NOTEBOOK_API_BASE_URL,
+                    notebook_auth=notebook_auth,
+                    auth_seed=auth_seed,
+                )
+            )
+        except Exception as e:
+            raise HTTPException(
+                status_code=status.HTTP_502_BAD_GATEWAY,
+                detail=(
+                    "No se pudo validar cuantas fuentes tiene el notebook destino. "
+                    f"Valida las cookies de NotebookLM e intenta nuevamente. Detalle: {e}"
+                ),
+            ) from e
+
+    available_slots = max(0, NOTEBOOK_SOURCES_PER_NOTEBOOK - current_sources)
+    if document_count <= available_slots:
+        return
+
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            "La seleccion excede la capacidad configurada de NotebookLM: "
+            f"{NOTEBOOK_SOURCES_PER_NOTEBOOK} fuente(s) por notebook. "
+            f"El notebook destino ya tiene {current_sources} fuente(s), "
+            f"quedan {available_slots} cupo(s), y seleccionaste {document_count}. "
+            "Selecciona menos documentos, crea otro notebook para el siguiente lote, "
+            "o ajusta NOTEBOOK_SOURCES_PER_NOTEBOOK si tu cuenta tiene un limite mayor."
+        ),
+    )
 
 
 def parse_cors_origins(raw_value: str) -> List[str]:
@@ -271,6 +324,14 @@ class DownloadSelectedDocumentsZipRequest(BaseModel):
         ...,
         description="IDs de documentos visibles/seleccionados por el frontend para exportar en zip.",
     )
+
+
+class SelectedDocumentsZipExportResponse(BaseModel):
+    export_id: str
+    filename: str
+    size_bytes: int
+    part_size_bytes: int
+    parts: int
 
 
 class ShareSetPublicRequest(BaseModel):
@@ -1087,6 +1148,65 @@ def sanitize_zip_entry_filename(file_name: str, fallback: str) -> str:
     return safe_name or "documento"
 
 
+def selected_documents_zip_export_id(run_id: str, selected_document_ids: List[str]) -> str:
+    """Genera un identificador estable para una seleccion de documentos."""
+    normalized_ids = [
+        str(document_id).strip()
+        for document_id in selected_document_ids
+        if str(document_id).strip()
+    ]
+    payload = {
+        "run_id": str(run_id or "").strip(),
+        "selected_document_ids": normalized_ids,
+    }
+    encoded_payload = json.dumps(
+        payload,
+        ensure_ascii=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded_payload).hexdigest()[:16]
+
+
+def validate_zip_export_id(export_id: str) -> str:
+    """Valida que el export_id no pueda escapar del directorio de exportaciones."""
+    normalized_export_id = str(export_id or "").strip().lower()
+    if (
+        len(normalized_export_id) != 16
+        or any(ch not in "0123456789abcdef" for ch in normalized_export_id)
+    ):
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="export_id invalido.",
+        )
+    return normalized_export_id
+
+
+def selected_documents_export_dir(run: Dict[str, Any]) -> Path:
+    """Directorio donde se guardan los ZIP exportados desde la tabla."""
+    output_dir = str(run.get("output_dir") or "").strip()
+    if not output_dir:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="La corrida no tiene output_dir configurado para empaquetar documentos.",
+        )
+
+    base_dir = Path(resolve_document_path(output_dir, ".")).resolve()
+    export_dir = base_dir / "_table_exports"
+    os.makedirs(_long_path(export_dir), exist_ok=True)
+    return export_dir
+
+
+def selected_documents_zip_path(run: Dict[str, Any], export_id: Optional[str] = None) -> Path:
+    """Retorna la ruta fisica del ZIP de documentos seleccionados."""
+    run_id = str(run.get("id") or "").strip()
+    normalized_export_id = validate_zip_export_id(export_id) if export_id else ""
+    export_suffix = f"_{normalized_export_id}" if normalized_export_id else ""
+    return (
+        selected_documents_export_dir(run)
+        / f"documentos_para_notebook_{run_id[:8] or 'corrida'}{export_suffix}.zip"
+    )
+
+
 def build_retry_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -> Path:
     """Empaqueta documentos pendientes/fallidos en un zip descargable para carga manual."""
     output_dir = str(run.get("output_dir") or "").strip()
@@ -1169,22 +1289,16 @@ def build_retry_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -
     return zip_path
 
 
-def build_selected_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -> Path:
+def build_selected_documents_zip(
+    run: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+    export_id: Optional[str] = None,
+) -> Path:
     """Empaqueta documentos visibles usando nombre_para_notebook como nombre dentro del zip."""
     output_dir = str(run.get("output_dir") or "").strip()
-    if not output_dir:
-        raise HTTPException(
-            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
-            detail="La corrida no tiene output_dir configurado para empaquetar documentos.",
-        )
-
-    base_dir = Path(resolve_document_path(output_dir, ".")).resolve()
-    export_dir = base_dir / "_table_exports"
-    os.makedirs(_long_path(export_dir), exist_ok=True)
-
     run_id = str(run.get("id") or "").strip()
     run_tipo = str(run.get("tipo") or "").strip()
-    zip_path = export_dir / f"documentos_para_notebook_{run_id[:8] or 'corrida'}.zip"
+    zip_path = selected_documents_zip_path(run, export_id)
 
     seen_arc_names: set[str] = set()
     included_count = 0
@@ -1661,6 +1775,12 @@ def create_adenda_notebook_from_selection(
     if create_new_notebook and not notebook_name:
         notebook_name = build_tipo_notebook_title(tipo, id_documento)
 
+    validate_notebook_source_capacity(
+        len(selected_rows),
+        notebook_id=existing_notebook_id,
+        notebook_auth=notebook_auth,
+    )
+
     selected_documents = []
     for row in selected_rows:
         enriched_row = with_run_context(row, tipo=tipo)
@@ -1825,6 +1945,123 @@ def download_selected_documents_zip(
 
 
 @app.post(
+    "/api/v1/adenda/descarga-documentos-seia/{run_id}/documentos-seleccionados/export",
+    response_model=SelectedDocumentsZipExportResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def create_selected_documents_zip_export(
+    run_id: str,
+    payload: DownloadSelectedDocumentsZipRequest,
+) -> SelectedDocumentsZipExportResponse:
+    """Prepara un ZIP y devuelve metadata para descargarlo por partes pequenas."""
+    selected_document_ids = [
+        str(document_id).strip()
+        for document_id in payload.selected_document_ids
+        if str(document_id).strip()
+    ]
+    if not selected_document_ids:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Debes enviar al menos un document_id para preparar el zip.",
+        )
+
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, run_id)
+        selected_rows = load_selected_documents(supabase, run_id, selected_document_ids)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error preparando exportacion de documentos visibles: {e}",
+        ) from e
+
+    export_id = selected_documents_zip_export_id(run_id, selected_document_ids)
+    zip_path = build_selected_documents_zip(run, selected_rows, export_id=export_id)
+    size_bytes = zip_path.stat().st_size
+    parts = max(1, (size_bytes + ZIP_EXPORT_PART_SIZE_BYTES - 1) // ZIP_EXPORT_PART_SIZE_BYTES)
+    return SelectedDocumentsZipExportResponse(
+        export_id=export_id,
+        filename=zip_path.name,
+        size_bytes=size_bytes,
+        part_size_bytes=ZIP_EXPORT_PART_SIZE_BYTES,
+        parts=parts,
+    )
+
+
+@app.get(
+    "/api/v1/adenda/descarga-documentos-seia/{run_id}/documentos-seleccionados/export/{export_id}/part/{part_index}",
+    dependencies=[Depends(require_bearer_token)],
+)
+def download_selected_documents_zip_export_part(
+    run_id: str,
+    export_id: str,
+    part_index: int,
+) -> Response:
+    """Descarga una parte pequena de un ZIP preparado previamente."""
+    normalized_export_id = validate_zip_export_id(export_id)
+    if part_index < 0:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="part_index debe ser mayor o igual a 0.",
+        )
+
+    try:
+        supabase = get_supabase_client()
+        run = load_run(supabase, run_id)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error leyendo corrida para descargar parte del zip: {e}",
+        ) from e
+
+    zip_path = selected_documents_zip_path(run, normalized_export_id)
+    if not _path_exists(zip_path):
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="No existe el ZIP preparado. Vuelve a iniciar la descarga.",
+        )
+
+    size_bytes = zip_path.stat().st_size
+    if size_bytes <= 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="El ZIP preparado esta vacio. Vuelve a iniciar la descarga.",
+        )
+
+    start = part_index * ZIP_EXPORT_PART_SIZE_BYTES
+    if start >= size_bytes:
+        raise HTTPException(
+            status_code=status.HTTP_416_REQUESTED_RANGE_NOT_SATISFIABLE,
+            detail="La parte solicitada esta fuera del tamano del ZIP.",
+        )
+    end = min(start + ZIP_EXPORT_PART_SIZE_BYTES, size_bytes) - 1
+    chunk_size = end - start + 1
+    parts = max(1, (size_bytes + ZIP_EXPORT_PART_SIZE_BYTES - 1) // ZIP_EXPORT_PART_SIZE_BYTES)
+
+    with open(_long_path(zip_path), "rb") as zip_file:
+        zip_file.seek(start)
+        content = zip_file.read(chunk_size)
+
+    return Response(
+        content=content,
+        media_type="application/octet-stream",
+        headers={
+            "Accept-Ranges": "bytes",
+            "Content-Length": str(len(content)),
+            "Content-Range": f"bytes {start}-{end}/{size_bytes}",
+            "X-Zip-Export-Id": normalized_export_id,
+            "X-Zip-Part-Index": str(part_index),
+            "X-Zip-Part-Count": str(parts),
+            "X-Zip-Filename": zip_path.name,
+        },
+    )
+
+
+@app.post(
     "/api/v1/adenda/reintentar-carga-notebook",
     response_model=RetryUploadResponse,
     dependencies=[Depends(require_bearer_token)],
@@ -1876,6 +2113,13 @@ def retry_failed_notebook_upload(
             retry_document_ids=[],
             selected_documents=[],
         )
+
+    validate_notebook_source_capacity(
+        len(failed_rows),
+        notebook_id=notebook_id,
+        notebook_auth=notebook_auth,
+        auth_seed=auth_seed,
+    )
 
     retry_attempts = set_run_retry_attempts(
         supabase,
