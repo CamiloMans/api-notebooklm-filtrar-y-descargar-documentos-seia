@@ -6,10 +6,13 @@ import asyncio
 import base64
 import hashlib
 import json
+import math
 import os
 import threading
 import uuid
 import zipfile
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable, Dict, List, Literal, Optional
 from urllib.parse import urlparse
@@ -54,6 +57,17 @@ from download_documento_seia import (
     run_seia_notebook_pipeline,
     upload_documents_batch_and_single,
 )
+from keepalive_worker import run_keepalive_loop
+from notebook_auth_store import (
+    compute_days_until_soft_expiry,
+    decrypt_payload,
+    delete_credentials,
+    load_credentials,
+    mark_credentials_status,
+    parse_timestamp,
+    store_credentials,
+    touch_last_used,
+)
 
 if load_dotenv:
     load_dotenv()
@@ -88,7 +102,19 @@ _SUPABASE_CLIENT: Optional[Client] = None
 _JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
 RETRYABLE_UPLOAD_STATUSES = ("failed", "not_uploaded", "selected", "uploading", "pending")
 NOTEBOOK_AUTH_HEADER = "X-NotebookLM-Auth"
+NOTEBOOK_USER_JWT_HEADER = "X-Myma-User-JWT"
 ZIP_EXPORT_PART_SIZE_BYTES = getenv_positive_int("ZIP_EXPORT_PART_SIZE_BYTES", 8 * 1024 * 1024)
+NOTEBOOK_AUTH_SOFT_EXPIRY_DAYS = getenv_positive_int("NOTEBOOK_AUTH_SOFT_EXPIRY_DAYS", 14)
+NOTEBOOK_KEEPALIVE_ENABLED = os.getenv("NOTEBOOK_KEEPALIVE_ENABLED", "false").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "on",
+}
+NOTEBOOK_KEEPALIVE_INTERVAL_SEC = getenv_positive_int("NOTEBOOK_KEEPALIVE_INTERVAL_SEC", 1800)
+NOTEBOOK_KEEPALIVE_ACTIVE_DAYS = getenv_positive_int("NOTEBOOK_KEEPALIVE_ACTIVE_DAYS", 7)
+NOTEBOOK_KEEPALIVE_MAX_CONCURRENCY = getenv_positive_int("NOTEBOOK_KEEPALIVE_MAX_CONCURRENCY", 2)
+NOTEBOOK_KEEPALIVE_TIMEOUT_SEC = getenv_positive_int("NOTEBOOK_KEEPALIVE_TIMEOUT_SEC", 20)
 
 
 def validate_notebook_source_capacity(
@@ -114,7 +140,9 @@ def validate_notebook_source_capacity(
                     auth_seed=auth_seed,
                 )
             )
+            _touch_stored_notebook_credentials(notebook_auth)
         except Exception as e:
+            _mark_stored_notebook_credentials_failure(notebook_auth, e)
             raise HTTPException(
                 status_code=status.HTTP_502_BAD_GATEWAY,
                 detail=(
@@ -363,10 +391,63 @@ class ValidateCookiesRequest(BaseModel):
     )
 
 
+class NotebookCredentialsStoreRequest(BaseModel):
+    cookies_text: str = Field(
+        ...,
+        min_length=1,
+        description="Cookies Netscape o storage JSON de Playwright para guardar en la cuenta MyMA.",
+    )
+
+
+class NotebookCredentialsStatusResponse(BaseModel):
+    has_credentials: bool
+    valid: bool
+    status: str
+    validated_at: Optional[str] = None
+    last_checked_at: Optional[str] = None
+    last_used_at: Optional[str] = None
+    cookie_names: List[str] = Field(default_factory=list)
+    days_until_soft_expiry: Optional[int] = None
+    last_error: str = ""
+    failure_count: int = 0
+    keepalive_enabled: bool
+
+
+class NotebookCredentialsDeleteResponse(BaseModel):
+    deleted: bool
+
+
+@asynccontextmanager
+async def app_lifespan(app: FastAPI):
+    keepalive_task: Optional[asyncio.Task[Any]] = None
+    if NOTEBOOK_KEEPALIVE_ENABLED:
+        keepalive_task = asyncio.create_task(
+            run_keepalive_loop(
+                get_client=get_supabase_client,
+                interval_sec=NOTEBOOK_KEEPALIVE_INTERVAL_SEC,
+                active_days=NOTEBOOK_KEEPALIVE_ACTIVE_DAYS,
+                max_concurrency=NOTEBOOK_KEEPALIVE_MAX_CONCURRENCY,
+                timeout_sec=NOTEBOOK_KEEPALIVE_TIMEOUT_SEC,
+            )
+        )
+        app.state.notebook_keepalive_task = keepalive_task
+
+    try:
+        yield
+    finally:
+        if keepalive_task is not None:
+            keepalive_task.cancel()
+            try:
+                await keepalive_task
+            except asyncio.CancelledError:
+                pass
+
+
 app = FastAPI(
     title="SEIA Notebook API",
     version="1.0.0",
     description="Crea notebook desde documento SEIA y persiste notebooklm_id en Supabase.",
+    lifespan=app_lifespan,
 )
 
 app.add_middleware(
@@ -386,6 +467,161 @@ def get_supabase_client() -> Client:
             raise RuntimeError("SUPABASE_URL/SUPABASE_KEY no configurados.")
         _SUPABASE_CLIENT = create_client(SUPABASE_URL, SUPABASE_KEY)
     return _SUPABASE_CLIENT
+
+
+def _resolve_user_id_from_jwt(
+    raw_jwt: Optional[str],
+    *,
+    raise_if_missing: bool,
+) -> Optional[str]:
+    normalized_jwt = (raw_jwt or "").strip()
+    if not normalized_jwt:
+        if raise_if_missing:
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail=f"Falta header {NOTEBOOK_USER_JWT_HEADER} valido.",
+            )
+        return None
+
+    try:
+        user_response = get_supabase_client().auth.get_user(normalized_jwt)
+        user = getattr(user_response, "user", None)
+        user_id = str(getattr(user, "id", "") or "").strip()
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No fue posible validar la sesion del usuario.",
+        ) from exc
+
+    if not user_id:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="No fue posible identificar al usuario autenticado.",
+        )
+    return user_id
+
+
+def get_current_user_id(
+    x_myma_user_jwt: Optional[str] = Header(default=None, alias=NOTEBOOK_USER_JWT_HEADER),
+) -> str:
+    return _resolve_user_id_from_jwt(x_myma_user_jwt, raise_if_missing=True) or ""
+
+
+def _row_timestamp_to_iso(value: Any) -> Optional[str]:
+    parsed = parse_timestamp(value)
+    return parsed.isoformat() if parsed is not None else None
+
+
+def _notebook_credentials_status_payload(
+    row: Optional[Dict[str, Any]],
+) -> NotebookCredentialsStatusResponse:
+    if not row:
+        return NotebookCredentialsStatusResponse(
+            has_credentials=False,
+            valid=False,
+            status="missing",
+            validated_at=None,
+            last_checked_at=None,
+            last_used_at=None,
+            cookie_names=[],
+            days_until_soft_expiry=None,
+            last_error="",
+            failure_count=0,
+            keepalive_enabled=NOTEBOOK_KEEPALIVE_ENABLED,
+        )
+
+    normalized_status = str(row.get("status") or "").strip() or "unknown"
+    return NotebookCredentialsStatusResponse(
+        has_credentials=True,
+        valid=normalized_status == "valid",
+        status=normalized_status,
+        validated_at=_row_timestamp_to_iso(row.get("validated_at")),
+        last_checked_at=_row_timestamp_to_iso(row.get("last_checked_at")),
+        last_used_at=_row_timestamp_to_iso(row.get("last_used_at")),
+        cookie_names=[str(name).strip() for name in (row.get("cookie_names") or []) if str(name).strip()],
+        days_until_soft_expiry=compute_days_until_soft_expiry(
+            row.get("validated_at"),
+            soft_expiry_days=NOTEBOOK_AUTH_SOFT_EXPIRY_DAYS,
+        ),
+        last_error=str(row.get("last_error") or "").strip(),
+        failure_count=to_int(row.get("failure_count")),
+        keepalive_enabled=NOTEBOOK_KEEPALIVE_ENABLED,
+    )
+
+
+def _is_stored_notebook_credentials_payload(notebook_auth: Optional[Dict[str, Any]]) -> bool:
+    return bool(
+        isinstance(notebook_auth, dict)
+        and str(notebook_auth.get("_credentials_source") or "").strip() == "stored"
+        and str(notebook_auth.get("_credentials_user_id") or "").strip()
+    )
+
+
+def _stored_notebook_credentials_user_id(notebook_auth: Optional[Dict[str, Any]]) -> str:
+    if not _is_stored_notebook_credentials_payload(notebook_auth):
+        return ""
+    return str(notebook_auth.get("_credentials_user_id") or "").strip()
+
+
+def _touch_stored_notebook_credentials(notebook_auth: Optional[Dict[str, Any]]) -> None:
+    user_id = _stored_notebook_credentials_user_id(notebook_auth)
+    if not user_id:
+        return
+    try:
+        touch_last_used(get_supabase_client(), user_id)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[notebook-auth] No se pudo actualizar last_used_at para {user_id}: {exc}")
+
+
+def _is_notebook_auth_failure(exc: Exception) -> bool:
+    if isinstance(exc, AuthError):
+        return True
+
+    message = str(exc).strip().lower()
+    if not message:
+        return False
+
+    auth_markers = (
+        "accounts.google.com",
+        "auth notebooklm",
+        "cookie sid",
+        "cookies notebooklm",
+        "expirada",
+        "expired",
+        "falta header x-notebooklm-auth",
+        "failed to fetch tokens",
+        "invalid notebooklm credentials",
+        "login",
+        "no fue posible validar la sesion",
+        "no incluye la cookie sid",
+        "sesion notebooklm",
+        "unauthorized",
+    )
+    return any(marker in message for marker in auth_markers)
+
+
+def _mark_stored_notebook_credentials_failure(
+    notebook_auth: Optional[Dict[str, Any]],
+    exc: Exception,
+) -> None:
+    user_id = _stored_notebook_credentials_user_id(notebook_auth)
+    if not user_id:
+        return
+
+    message = str(exc).strip() or exc.__class__.__name__
+    next_status = "expired" if _is_notebook_auth_failure(exc) else "valid"
+    try:
+        mark_credentials_status(
+            get_supabase_client(),
+            user_id,
+            status=next_status,
+            last_error=message,
+            increment_failure=True,
+        )
+    except Exception as mark_exc:  # noqa: BLE001
+        print(f"[notebook-auth] No se pudo actualizar estado de credenciales para {user_id}: {mark_exc}")
 
 
 def require_bearer_token(authorization: Optional[str] = Header(default=None)) -> None:
@@ -414,18 +650,62 @@ def require_bearer_token(authorization: Optional[str] = Header(default=None)) ->
 
 def get_notebook_auth_payload(
     x_notebooklm_auth: Optional[str] = Header(default=None, alias=NOTEBOOK_AUTH_HEADER),
+    x_myma_user_jwt: Optional[str] = Header(default=None, alias=NOTEBOOK_USER_JWT_HEADER),
 ) -> Optional[Dict[str, Any]]:
-    """Decodifica auth NotebookLM por request cuando el header viene presente."""
-    if not x_notebooklm_auth or not x_notebooklm_auth.strip():
+    """Resuelve auth NotebookLM priorizando header explicito y luego credenciales guardadas."""
+    if x_notebooklm_auth and x_notebooklm_auth.strip():
+        try:
+            return decode_notebook_auth_header_value(x_notebooklm_auth)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=str(exc),
+            ) from exc
+
+    user_id = _resolve_user_id_from_jwt(x_myma_user_jwt, raise_if_missing=False)
+    if not user_id:
         return None
 
     try:
-        return decode_notebook_auth_header_value(x_notebooklm_auth)
+        credentials_row = load_credentials(get_supabase_client(), user_id)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudieron cargar las credenciales NotebookLM del usuario: {exc}",
+        ) from exc
+
+    if not credentials_row:
+        return None
+
+    status_value = str(credentials_row.get("status") or "").strip()
+    if status_value != "valid":
+        return None
+
+    try:
+        payload = decrypt_payload(str(credentials_row.get("payload_enc") or ""))
     except ValueError as exc:
         raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc),
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudieron decodificar las credenciales NotebookLM guardadas: {exc}",
         ) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudo abrir el almacenamiento cifrado de NotebookLM: {exc}",
+        ) from exc
+
+    if not isinstance(payload, dict):
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Las credenciales NotebookLM guardadas tienen un formato invalido.",
+        )
+
+    payload = dict(payload)
+    payload["_credentials_source"] = "stored"
+    payload["_credentials_user_id"] = user_id
+    return payload
 
 
 def _parse_share_permission(value: str) -> SharePermission:
@@ -531,10 +811,13 @@ def run_notebook_share_operation(
             return await operation(client)
 
     try:
-        return asyncio.run(_run())
+        result = asyncio.run(_run())
+        _touch_stored_notebook_credentials(notebook_auth)
+        return result
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
+        _mark_stored_notebook_credentials_failure(notebook_auth, exc)
         raise _map_notebook_share_exception(exc) from exc
 
 
@@ -1568,7 +1851,9 @@ def process_notebook_upload_background(
             "progress_message": final_message,
             "error_message": "" if final_failed == 0 else str(run.get("error_message") or ""),
         }).eq("id", run_id).execute()
+        _touch_stored_notebook_credentials(notebook_auth)
     except Exception as e:
+        _mark_stored_notebook_credentials_failure(notebook_auth, e)
         mark_remaining_documents_for_retry(
             client=client,
             run_id=run_id,
@@ -1634,6 +1919,80 @@ def validate_cookies(body: ValidateCookiesRequest) -> Dict[str, Any]:
             "token_fetch_ok": False,
             "auth_payload": None,
         }
+
+
+@app.post(
+    "/api/v1/adenda/notebook/credentials",
+    response_model=NotebookCredentialsStatusResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def store_notebook_credentials(
+    body: NotebookCredentialsStoreRequest,
+    user_id: str = Depends(get_current_user_id),
+) -> NotebookCredentialsStatusResponse:
+    """Valida y guarda cookies NotebookLM cifradas por usuario."""
+    try:
+        storage_state, _format_detected = _normalize_storage_state_from_text(body.cookies_text)
+        auth_payload, missing_required = _build_compact_auth_payload_from_storage(storage_state)
+        if missing_required:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=(
+                    "Faltan cookies obligatorias para autenticar en NotebookLM: "
+                    + ", ".join(missing_required)
+                ),
+            )
+
+        asyncio.run(fetch_tokens(dict(auth_payload["cookies"])))
+        row = store_credentials(get_supabase_client(), user_id, auth_payload)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(exc).strip() or "No se pudieron validar/guardar las credenciales NotebookLM.",
+        ) from exc
+
+    return _notebook_credentials_status_payload(row)
+
+
+@app.get(
+    "/api/v1/adenda/notebook/credentials/status",
+    response_model=NotebookCredentialsStatusResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def get_notebook_credentials_status(
+    user_id: str = Depends(get_current_user_id),
+) -> NotebookCredentialsStatusResponse:
+    """Retorna el estado actual de las credenciales NotebookLM guardadas del usuario."""
+    try:
+        row = load_credentials(get_supabase_client(), user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudo consultar el estado de las credenciales NotebookLM: {exc}",
+        ) from exc
+
+    return _notebook_credentials_status_payload(row)
+
+
+@app.delete(
+    "/api/v1/adenda/notebook/credentials",
+    response_model=NotebookCredentialsDeleteResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def remove_notebook_credentials(
+    user_id: str = Depends(get_current_user_id),
+) -> NotebookCredentialsDeleteResponse:
+    """Elimina las credenciales NotebookLM guardadas del usuario autenticado."""
+    try:
+        delete_credentials(get_supabase_client(), user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudieron eliminar las credenciales NotebookLM: {exc}",
+        ) from exc
+    return NotebookCredentialsDeleteResponse(deleted=True)
 
 
 @app.get(
@@ -2178,7 +2537,9 @@ def retry_failed_notebook_upload(
                 "upload_status": "uploaded" if item.get("uploaded") else "failed",
                 "upload_error": "" if item.get("uploaded") else str(item.get("error") or "")[:2000],
             }).eq("id", document_id).execute()
+        _touch_stored_notebook_credentials(notebook_auth)
     except Exception as e:
+        _mark_stored_notebook_credentials_failure(notebook_auth, e)
         mark_remaining_documents_for_retry(
             client=supabase,
             run_id=payload.run_id,
@@ -2271,11 +2632,14 @@ def create_adenda_notebook(
                 on_notebook_created=on_notebook_created,
                 notebook_auth=notebook_auth,
             )
+        _touch_stored_notebook_credentials(notebook_auth)
     except NotebookAPIError as e:
+        _mark_stored_notebook_credentials_failure(notebook_auth, e)
         raise HTTPException(status_code=status.HTTP_502_BAD_GATEWAY, detail=str(e)) from e
     except HTTPException:
         raise
     except RuntimeError as e:
+        _mark_stored_notebook_credentials_failure(notebook_auth, e)
         message = str(e)
         if "No se encontraron documentos descargables" in message:
             raise HTTPException(
@@ -2287,6 +2651,7 @@ def create_adenda_notebook(
             detail=message,
         ) from e
     except Exception as e:
+        _mark_stored_notebook_credentials_failure(notebook_auth, e)
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error interno procesando solicitud: {e}",

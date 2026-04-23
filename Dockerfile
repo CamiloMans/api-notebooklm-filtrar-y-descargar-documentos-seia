@@ -11,7 +11,14 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY api_app.py download_documento_seia.py supabase_cp6b_schema.sql ./
+COPY \
+    api_app.py \
+    download_documento_seia.py \
+    keepalive_worker.py \
+    notebook_auth_store.py \
+    notebook_user_credentials_schema.sql \
+    supabase_cp6b_schema.sql \
+    ./
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
