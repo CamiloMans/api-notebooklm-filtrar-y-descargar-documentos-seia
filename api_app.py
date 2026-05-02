@@ -46,6 +46,7 @@ from download_documento_seia import (
     NOTEBOOK_SOURCES_PER_NOTEBOOK,
     NOTEBOOK_UPLOAD_LIMIT,
     NotebookAPIError,
+    NotebookCredentialsExpired,
     _long_path,
     _path_exists,
     build_adenda_notebook_title,
@@ -1908,7 +1909,12 @@ def process_notebook_upload_background(
     try:
         auth_seed = None
         if notebook_auth is not None:
-            auth_seed = prepare_notebook_client_seed(notebook_auth)
+            try:
+                auth_seed = prepare_notebook_client_seed(notebook_auth)
+            except ValueError as preflight_exc:
+                raise NotebookCredentialsExpired(
+                    f"Pre-flight NotebookLM fallo: {preflight_exc}"
+                ) from preflight_exc
 
         run = load_run(client, run_id)
         tipo = str(run.get("tipo") or "").strip()
@@ -1916,7 +1922,21 @@ def process_notebook_upload_background(
         if not tipo or not id_documento:
             raise RuntimeError("La corrida CP6B no tiene tipo/id_documento validos.")
 
-        selected_rows = load_selected_documents(client, run_id, selected_ids)
+        all_selected_rows = load_selected_documents(client, run_id, selected_ids)
+        already_uploaded_ids: List[str] = [
+            str(row["id"]) for row in all_selected_rows
+            if str(row.get("upload_status") or "").strip().lower() == "uploaded"
+        ]
+        selected_rows = [
+            row for row in all_selected_rows
+            if str(row.get("upload_status") or "").strip().lower() != "uploaded"
+        ]
+        if already_uploaded_ids:
+            attempted_document_ids.extend(already_uploaded_ids)
+            print(
+                f"[notebook-upload] Run {run_id}: {len(already_uploaded_ids)} doc(s) ya "
+                f"con upload_status=uploaded; se omiten."
+            )
         total_docs = max(1, len(selected_rows))
         create_new_notebook = bool(nombre_notebook)
         notebook_name = normalize_optional_text(nombre_notebook) or str(
@@ -2043,6 +2063,46 @@ def process_notebook_upload_background(
             "error_message": "" if final_failed == 0 else str(run.get("error_message") or ""),
         }).eq("id", run_id).execute()
         _touch_stored_notebook_credentials(notebook_auth)
+    except NotebookCredentialsExpired as e:
+        message = str(e).strip() or "Credenciales NotebookLM caducas."
+        user_id = (
+            (notebook_auth or {}).get("_credentials_user_id")
+            if isinstance(notebook_auth, dict) else None
+        )
+        if user_id:
+            try:
+                mark_credentials_status(
+                    client,
+                    str(user_id),
+                    status="expired",
+                    last_error=message,
+                    increment_failure=True,
+                    event_type="batch_expired",
+                    event_source="upload_background",
+                    event_ok=False,
+                )
+            except Exception as mark_exc:  # noqa: BLE001
+                print(
+                    f"[notebook-upload] No se pudo marcar status=expired para "
+                    f"{user_id}: {mark_exc}"
+                )
+        mark_remaining_documents_for_retry(
+            client=client,
+            run_id=run_id,
+            selected_ids=selected_ids,
+            attempted_document_ids=attempted_document_ids,
+            reason=f"Re-autenticacion NotebookLM requerida: {message}",
+        )
+        client.table("adenda_document_runs").update({
+            "status": "auth_required",
+            "progress_stage": "auth_required",
+            "progress_message": (
+                "Re-autenticacion NotebookLM requerida. "
+                "Pega cookies frescas y reintenta."
+            ),
+            "error_message": message[:2000],
+        }).eq("id", run_id).execute()
+        return
     except Exception as e:
         _mark_stored_notebook_credentials_failure(notebook_auth, e)
         mark_remaining_documents_for_retry(

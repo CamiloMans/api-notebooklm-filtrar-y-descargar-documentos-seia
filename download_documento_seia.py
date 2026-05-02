@@ -142,6 +142,10 @@ NOTEBOOK_UPLOAD_RETRY_BASE_SEC = float(
 NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC = float(
     os.getenv("NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC", "0.6") or "0.6"
 )
+NOTEBOOK_UPLOAD_VERBOSE_DIAG = os.getenv("NOTEBOOK_UPLOAD_VERBOSE_DIAG", "0").strip().lower() in {
+    "1", "true", "yes", "on",
+}
+_VERBOSE_DIAG_HEADER_KEEP = ("x-goog-", "content-type", "date", "server", "alt-svc")
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2391,6 +2395,55 @@ class NotebookAPIError(RuntimeError):
     """Error al interactuar con la API de notebook."""
 
 
+class NotebookCredentialsExpired(RuntimeError):
+    """Cookies NotebookLM caducas. Requiere re-pegado por el usuario."""
+
+
+def _verbose_diag_dump_source_error(
+    upload_name: str,
+    last_error: Exception,
+    current_seed: Optional[Dict[str, Any]],
+    attempt: int,
+) -> None:
+    """Imprime diagnostico extendido para fallos SourceAddError / SOURCE_ID."""
+    if not NOTEBOOK_UPLOAD_VERBOSE_DIAG:
+        return
+    response = getattr(last_error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    body_excerpt = ""
+    try:
+        if response is not None:
+            body_text = getattr(response, "text", None)
+            if body_text is None:
+                content = getattr(response, "content", None)
+                body_text = (content or b"").decode("utf-8", errors="replace")
+            body_excerpt = (body_text or "")[:2048]
+    except Exception as body_exc:  # noqa: BLE001
+        body_excerpt = f"<no se pudo leer body: {type(body_exc).__name__}>"
+    headers_filtered: Dict[str, str] = {}
+    try:
+        raw_headers = getattr(response, "headers", None) or {}
+        for hk, hv in raw_headers.items():
+            hk_lower = str(hk).lower()
+            if hk_lower == "set-cookie":
+                continue
+            if any(hk_lower == k or hk_lower.startswith(k) for k in _VERBOSE_DIAG_HEADER_KEEP):
+                headers_filtered[hk] = str(hv)
+    except Exception:  # noqa: BLE001
+        pass
+    cookie_names = sorted((current_seed or {}).get("cookies", {}).keys())
+    print(
+        f"      [diag verbose] attempt={attempt} archivo={console_safe(upload_name)} "
+        f"err={type(last_error).__name__} status_code={status_code}"
+    )
+    if headers_filtered:
+        print(f"      [diag verbose] headers={json.dumps(headers_filtered, ensure_ascii=False)}")
+    if cookie_names:
+        print(f"      [diag verbose] cookie_names={cookie_names}")
+    if body_excerpt:
+        print(f"      [diag verbose] body_excerpt={body_excerpt!r}")
+
+
 def build_notebook_title():
     """Construye el titulo de notebook con fecha-hora local."""
     return f"Notebook {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -2713,11 +2766,16 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
         if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
             refresh_note = ""
             if isinstance(last_error, SourceAddError) or "SOURCE_ID" in str(last_error):
+                _verbose_diag_dump_source_error(upload_name, last_error, current_seed, attempt)
                 try:
                     refreshed = asyncio.run(_refresh_tokens())
                     if refreshed:
                         current_seed = refreshed
                         refresh_note = " [tokens refrescados]"
+                except ValueError as refresh_exc:
+                    raise NotebookCredentialsExpired(
+                        f"Cookies NotebookLM caducas durante refresh: {refresh_exc}"
+                    ) from refresh_exc
                 except Exception as refresh_exc:
                     refresh_note = f" [refresh tokens fallo: {type(refresh_exc).__name__}]"
             sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
@@ -2845,6 +2903,8 @@ def upload_documents_batch_and_single(
         )
         future_map[future] = (order, doc)
 
+    credentials_expired_exc: Optional[NotebookCredentialsExpired] = None
+
     with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
         pending_iterator = iter(list(enumerate(selected, 1)))
         for _ in range(max_workers):
@@ -2857,7 +2917,18 @@ def upload_documents_batch_and_single(
             )
             for future in done:
                 order, _doc = future_map.pop(future)
-                item = future.result()
+                try:
+                    item = future.result()
+                except NotebookCredentialsExpired as exc:
+                    credentials_expired_exc = exc
+                    print(
+                        f"    [{order}] CREDENCIALES NOTEBOOKLM CADUCAS: {exc}. "
+                        f"Abortando batch."
+                    )
+                    for pending_future in list(future_map.keys()):
+                        pending_future.cancel()
+                    future_map.clear()
+                    break
                 completed_count += 1
                 if item.get("uploaded"):
                     uploaded_ok += 1
@@ -2904,6 +2975,14 @@ def upload_documents_batch_and_single(
     upload_items.sort(key=lambda item: item.get("_order", 0))
     for item in upload_items:
         item.pop("_order", None)
+
+    if credentials_expired_exc is not None:
+        raise NotebookCredentialsExpired(
+            f"Batch abortado por credenciales NotebookLM caducas tras "
+            f"{completed_count}/{total_selected} archivo(s). "
+            f"{credentials_expired_exc}"
+        ) from credentials_expired_exc
+
     return {
         "selected": len(selected),
         "uploaded_ok": uploaded_ok,
