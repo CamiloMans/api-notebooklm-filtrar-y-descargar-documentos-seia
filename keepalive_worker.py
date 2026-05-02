@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import random
+import time
 from datetime import timedelta
 from typing import Callable, Dict, List
 
@@ -34,15 +35,28 @@ async def _process_single_user(
     if not user_id:
         return
 
+    started_at = time.perf_counter()
+    cookie_count = None
+
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - started_at) * 1000)
+
     try:
         payload = decrypt_payload(str(row.get("payload_enc") or ""))
         cookies = payload.get("cookies") if isinstance(payload, dict) else None
         if not isinstance(cookies, dict) or not cookies:
             raise ValueError("Las credenciales guardadas no incluyen cookies validas.")
+        cookie_count = len(cookies)
 
         await asyncio.sleep(random.uniform(0.1, 0.8))
         await asyncio.wait_for(fetch_tokens(dict(cookies)), timeout=max(1, timeout_sec))
-        record_keepalive_result(get_client(), user_id, ok=True)
+        record_keepalive_result(
+            get_client(),
+            user_id,
+            ok=True,
+            duration_ms=_elapsed_ms(),
+            cookie_count=cookie_count,
+        )
     except asyncio.TimeoutError:
         record_keepalive_result(
             get_client(),
@@ -50,6 +64,8 @@ async def _process_single_user(
             ok=False,
             last_error="Keepalive NotebookLM agotado por timeout.",
             expired=False,
+            duration_ms=_elapsed_ms(),
+            cookie_count=cookie_count,
         )
     except ValueError as exc:
         record_keepalive_result(
@@ -58,6 +74,8 @@ async def _process_single_user(
             ok=False,
             last_error=str(exc).strip() or "Sesion NotebookLM expirada o invalida.",
             expired=True,
+            duration_ms=_elapsed_ms(),
+            cookie_count=cookie_count,
         )
     except Exception as exc:  # noqa: BLE001
         record_keepalive_result(
@@ -66,6 +84,8 @@ async def _process_single_user(
             ok=False,
             last_error=str(exc).strip() or exc.__class__.__name__,
             expired=False,
+            duration_ms=_elapsed_ms(),
+            cookie_count=cookie_count,
         )
 
 

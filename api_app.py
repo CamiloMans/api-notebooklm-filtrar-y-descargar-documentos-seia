@@ -8,7 +8,10 @@ import hashlib
 import json
 import math
 import os
+import re
+import time
 import threading
+import unicodedata
 import uuid
 import zipfile
 from contextlib import asynccontextmanager
@@ -104,6 +107,8 @@ RETRYABLE_UPLOAD_STATUSES = ("failed", "not_uploaded", "selected", "uploading", 
 NOTEBOOK_AUTH_HEADER = "X-NotebookLM-Auth"
 NOTEBOOK_USER_JWT_HEADER = "X-Myma-User-JWT"
 ZIP_EXPORT_PART_SIZE_BYTES = getenv_positive_int("ZIP_EXPORT_PART_SIZE_BYTES", 8 * 1024 * 1024)
+ZIP_ENTRY_FILENAME_MAX_CHARS = max(32, getenv_positive_int("ZIP_ENTRY_FILENAME_MAX_CHARS", 140))
+ZIP_ENTRY_PART_LIMITS = (18, 32, 42, 42)
 NOTEBOOK_AUTH_SOFT_EXPIRY_DAYS = getenv_positive_int("NOTEBOOK_AUTH_SOFT_EXPIRY_DAYS", 14)
 NOTEBOOK_KEEPALIVE_ENABLED = os.getenv("NOTEBOOK_KEEPALIVE_ENABLED", "false").strip().lower() in {
     "1",
@@ -551,6 +556,70 @@ def _notebook_credentials_status_payload(
     )
 
 
+def _revalidate_stored_notebook_credentials(user_id: str) -> NotebookCredentialsStatusResponse:
+    client = get_supabase_client()
+    started_at = time.perf_counter()
+    cookie_count = None
+
+    def _elapsed_ms() -> int:
+        return int((time.perf_counter() - started_at) * 1000)
+
+    try:
+        row = load_credentials(client, user_id)
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"No se pudo consultar el estado de las credenciales NotebookLM: {exc}",
+        ) from exc
+
+    if not row:
+        return _notebook_credentials_status_payload(None)
+
+    try:
+        payload = decrypt_payload(str(row.get("payload_enc") or ""))
+        cookies = payload.get("cookies") if isinstance(payload, dict) else None
+        if not isinstance(cookies, dict) or not cookies:
+            raise ValueError("Las credenciales guardadas no incluyen cookies validas.")
+        cookie_count = len(cookies)
+
+        asyncio.run(
+            asyncio.wait_for(
+                fetch_tokens(dict(cookies)),
+                timeout=max(1, NOTEBOOK_KEEPALIVE_TIMEOUT_SEC),
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        message = str(exc).strip() or exc.__class__.__name__
+        is_expired = isinstance(exc, ValueError) or _is_notebook_auth_failure(exc)
+        updated_row = mark_credentials_status(
+            client,
+            user_id,
+            status="expired" if is_expired else "valid",
+            last_error=message,
+            increment_failure=True,
+            event_type="revalidate",
+            event_source="manual_revalidate",
+            event_ok=False,
+            event_duration_ms=_elapsed_ms(),
+            event_cookie_count=cookie_count,
+        )
+        return _notebook_credentials_status_payload(updated_row or row)
+
+    updated_row = mark_credentials_status(
+        client,
+        user_id,
+        status="valid",
+        last_error="",
+        reset_failure=True,
+        event_type="revalidate",
+        event_source="manual_revalidate",
+        event_ok=True,
+        event_duration_ms=_elapsed_ms(),
+        event_cookie_count=cookie_count,
+    )
+    return _notebook_credentials_status_payload(updated_row or row)
+
+
 def _is_stored_notebook_credentials_payload(notebook_auth: Optional[Dict[str, Any]]) -> bool:
     return bool(
         isinstance(notebook_auth, dict)
@@ -619,6 +688,9 @@ def _mark_stored_notebook_credentials_failure(
             status=next_status,
             last_error=message,
             increment_failure=True,
+            event_type="operation_failure",
+            event_source="notebook_operation",
+            event_ok=False,
         )
     except Exception as mark_exc:  # noqa: BLE001
         print(f"[notebook-auth] No se pudo actualizar estado de credenciales para {user_id}: {mark_exc}")
@@ -652,60 +724,64 @@ def get_notebook_auth_payload(
     x_notebooklm_auth: Optional[str] = Header(default=None, alias=NOTEBOOK_AUTH_HEADER),
     x_myma_user_jwt: Optional[str] = Header(default=None, alias=NOTEBOOK_USER_JWT_HEADER),
 ) -> Optional[Dict[str, Any]]:
-    """Resuelve auth NotebookLM priorizando header explicito y luego credenciales guardadas."""
-    if x_notebooklm_auth and x_notebooklm_auth.strip():
+    """Resuelve auth NotebookLM priorizando credenciales guardadas por usuario."""
+    has_explicit_auth = bool(x_notebooklm_auth and x_notebooklm_auth.strip())
+    user_id = None
+    if x_myma_user_jwt and x_myma_user_jwt.strip():
         try:
-            return decode_notebook_auth_header_value(x_notebooklm_auth)
+            user_id = _resolve_user_id_from_jwt(x_myma_user_jwt, raise_if_missing=False)
+        except HTTPException:
+            if not has_explicit_auth:
+                raise
+
+    if user_id:
+        try:
+            credentials_row = load_credentials(get_supabase_client(), user_id)
+        except HTTPException:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"No se pudieron cargar las credenciales NotebookLM del usuario: {exc}",
+            ) from exc
+
+        if credentials_row:
+            status_value = str(credentials_row.get("status") or "").strip()
+            if status_value == "valid":
+                try:
+                    payload = decrypt_payload(str(credentials_row.get("payload_enc") or ""))
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"No se pudieron decodificar las credenciales NotebookLM guardadas: {exc}",
+                    ) from exc
+                except Exception as exc:  # noqa: BLE001
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"No se pudo abrir el almacenamiento cifrado de NotebookLM: {exc}",
+                    ) from exc
+
+                if not isinstance(payload, dict):
+                    raise HTTPException(
+                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail="Las credenciales NotebookLM guardadas tienen un formato invalido.",
+                    )
+
+                payload = dict(payload)
+                payload["_credentials_source"] = "stored"
+                payload["_credentials_user_id"] = user_id
+                return payload
+
+    if has_explicit_auth:
+        try:
+            return decode_notebook_auth_header_value(x_notebooklm_auth or "")
         except ValueError as exc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail=str(exc),
             ) from exc
 
-    user_id = _resolve_user_id_from_jwt(x_myma_user_jwt, raise_if_missing=False)
-    if not user_id:
-        return None
-
-    try:
-        credentials_row = load_credentials(get_supabase_client(), user_id)
-    except HTTPException:
-        raise
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"No se pudieron cargar las credenciales NotebookLM del usuario: {exc}",
-        ) from exc
-
-    if not credentials_row:
-        return None
-
-    status_value = str(credentials_row.get("status") or "").strip()
-    if status_value != "valid":
-        return None
-
-    try:
-        payload = decrypt_payload(str(credentials_row.get("payload_enc") or ""))
-    except ValueError as exc:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"No se pudieron decodificar las credenciales NotebookLM guardadas: {exc}",
-        ) from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"No se pudo abrir el almacenamiento cifrado de NotebookLM: {exc}",
-        ) from exc
-
-    if not isinstance(payload, dict):
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail="Las credenciales NotebookLM guardadas tienen un formato invalido.",
-        )
-
-    payload = dict(payload)
-    payload["_credentials_source"] = "stored"
-    payload["_credentials_user_id"] = user_id
-    return payload
+    return None
 
 
 def _parse_share_permission(value: str) -> SharePermission:
@@ -1417,6 +1493,112 @@ def resolve_document_path(output_dir: str, ruta_relativa: str) -> str:
     return str(candidate)
 
 
+def normalize_zip_name_part(value: str) -> str:
+    """Normaliza una parte del nombre sin agregar hash."""
+    normalized = str(value or "").strip()
+    for char in '<>:"/\\|?*':
+        normalized = normalized.replace(char, "_")
+    normalized = unicodedata.normalize("NFKD", normalized)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = normalized.replace(".", "-")
+    normalized = re.sub(r"[ _]+", "_", normalized).strip(" ._-")
+    return normalized
+
+
+def truncate_zip_name_part(value: str, max_chars: int) -> str:
+    """Recorta una parte del nombre manteniendo cortes limpios."""
+    normalized = normalize_zip_name_part(value)
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[:max_chars].rstrip(" ._")
+
+
+def split_zip_filename_extension(file_name: str) -> tuple[str, str]:
+    """Separa stem/extension; solo la extension conserva punto."""
+    path = PurePosixPath(str(file_name or "").strip())
+    extension = path.suffix if 1 < len(path.suffix) <= 20 else ""
+    stem = path.stem if extension else path.name
+    return stem, extension.lower()
+
+
+def compact_zip_entry_filename(file_name: str) -> str:
+    """Mantiene nombres internos del ZIP compatibles con el extractor nativo de Windows."""
+    safe_name = str(file_name or "").strip(" .")
+    if not safe_name:
+        return "documento"
+
+    raw_stem, extension = split_zip_filename_extension(safe_name)
+    stem = normalize_zip_name_part(raw_stem) or "documento"
+    safe_name = f"{stem}{extension}"
+    if len(safe_name) <= ZIP_ENTRY_FILENAME_MAX_CHARS:
+        return safe_name
+
+    suffix = extension
+    stem_budget = max(1, ZIP_ENTRY_FILENAME_MAX_CHARS - len(suffix))
+    truncated_stem = stem[:stem_budget].rstrip(" ._-") or "documento"
+    return f"{truncated_stem}{suffix}"
+
+
+def zip_entry_filename_with_suffix(file_name: str, suffix_number: int) -> str:
+    """Agrega sufijo de duplicado sin exceder el limite de nombre ZIP."""
+    raw_stem, extension = split_zip_filename_extension(file_name)
+    stem = normalize_zip_name_part(raw_stem) or "documento"
+    suffix = f"_{suffix_number}{extension}"
+    stem_budget = max(1, ZIP_ENTRY_FILENAME_MAX_CHARS - len(suffix))
+    return f"{(stem[:stem_budget].rstrip(' ._-') or 'documento')}{suffix}"
+
+
+def build_zip_entry_filename_from_row(
+    row: Dict[str, Any],
+    *,
+    tipo: str,
+    fallback_name: str,
+    index: int,
+) -> str:
+    """Arma nombre ZIP desde partes cortas para evitar rutas largas en Windows."""
+    ruta_relativa = str(row.get("ruta_relativa") or "")
+    original_name = str(row.get("nombre_archivo") or "")
+    final_name = str(row.get("nombre_archivo_final") or "")
+    current_path = PurePosixPath(ruta_relativa.replace("\\", "/") or final_name or original_name)
+    extension = (
+        PurePosixPath(final_name).suffix
+        or PurePosixPath(original_name).suffix
+        or current_path.suffix
+        or PurePosixPath(fallback_name).suffix
+    )
+    if not extension:
+        formato = str(row.get("formato") or "").strip().lstrip(".")
+        if formato:
+            extension = f".{formato.lower()}"
+    if not extension:
+        extension = ".pdf"
+
+    stem_source = (
+        PurePosixPath(original_name).stem
+        or PurePosixPath(final_name).stem
+        or current_path.stem
+        or PurePosixPath(fallback_name).stem
+        or f"documento_{index}"
+    )
+    raw_parts = [
+        tipo,
+        str(row.get("categoria") or ""),
+        str(row.get("texto_link") or ""),
+        stem_source,
+    ]
+    parts = [
+        truncate_zip_name_part(part, ZIP_ENTRY_PART_LIMITS[min(part_index, len(ZIP_ENTRY_PART_LIMITS) - 1)])
+        for part_index, part in enumerate(raw_parts)
+    ]
+    parts = [part for part in parts if part]
+    if not parts:
+        return sanitize_zip_entry_filename(fallback_name, f"documento_{index}{extension}")
+
+    file_name = f"{'_'.join(parts)}{extension.lower()}"
+    return compact_zip_entry_filename(file_name)
+
+
 def sanitize_zip_entry_filename(file_name: str, fallback: str) -> str:
     """Normaliza nombres de archivo para que se puedan extraer bien desde Windows."""
     raw_name = str(file_name or "").strip()
@@ -1428,7 +1610,7 @@ def sanitize_zip_entry_filename(file_name: str, fallback: str) -> str:
         ch if ch not in '<>:"/\\|?*' and ord(ch) >= 32 else "_"
         for ch in candidate
     ).strip(" .")
-    return safe_name or "documento"
+    return compact_zip_entry_filename(safe_name or "documento")
 
 
 def selected_documents_zip_export_id(run_id: str, selected_document_ids: List[str]) -> str:
@@ -1584,8 +1766,10 @@ def build_selected_documents_zip(
     zip_path = selected_documents_zip_path(run, export_id)
 
     seen_arc_names: set[str] = set()
+    seen_source_paths: set[str] = set()
     included_count = 0
     missing_entries: List[str] = []
+    duplicate_entries: List[str] = []
 
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zip_file:
         for index, row in enumerate(rows, start=1):
@@ -1598,24 +1782,18 @@ def build_selected_documents_zip(
                 missing_entries.append(f"- {fallback_name}: no se encontro el archivo fisico.")
                 continue
 
-            public_document = public_document_from_row(row, tipo=run_tipo)
-            notebook_name = sanitize_zip_entry_filename(
-                public_document.nombre_para_notebook,
-                fallback_name,
-            )
-            notebook_path = PurePosixPath(notebook_name)
-            extension = notebook_path.suffix or Path(fallback_name).suffix
-            if not extension:
-                formato = str(row.get("formato") or "").strip().lstrip(".")
-                if formato:
-                    extension = f".{formato.lower()}"
+            source_key = os.path.normcase(str(source_path.resolve()))
+            if source_key in seen_source_paths:
+                duplicate_entries.append(f"- {fallback_name}: archivo duplicado omitido.")
+                continue
+            seen_source_paths.add(source_key)
 
-            stem = notebook_path.stem or f"documento_{index}"
-            archive_file_name = notebook_path.name
-            if extension and not notebook_path.suffix:
-                archive_file_name = f"{stem}{extension}"
-            elif not archive_file_name:
-                archive_file_name = f"{stem}{extension}"
+            archive_file_name = build_zip_entry_filename_from_row(
+                row,
+                tipo=run_tipo,
+                fallback_name=fallback_name,
+                index=index,
+            )
 
             base_arc_name = PurePosixPath(
                 "documentos_para_notebook",
@@ -1628,7 +1806,12 @@ def build_selected_documents_zip(
                 dup_stem = arc_path.stem or "documento"
                 dup_extension = arc_path.suffix
                 parent = arc_path.parent
-                arc_name = parent.joinpath(f"{dup_stem}_{suffix}{dup_extension}").as_posix()
+                arc_name = parent.joinpath(
+                    zip_entry_filename_with_suffix(
+                        f"{dup_stem}{dup_extension}",
+                        suffix,
+                    )
+                ).as_posix()
                 suffix += 1
 
             seen_arc_names.add(arc_name)
@@ -1648,6 +1831,14 @@ def build_selected_documents_zip(
                     "",
                     "Archivos no incluidos porque no se encontraron en disco:",
                     *missing_entries,
+                ]
+            )
+        if duplicate_entries:
+            readme_lines.extend(
+                [
+                    "",
+                    "Archivos duplicados omitidos:",
+                    *duplicate_entries,
                 ]
             )
         zip_file.writestr("LEEME.txt", "\n".join(readme_lines))
@@ -1687,7 +1878,7 @@ def process_cp6b_listing_background(
                 tipo=tipo,
                 output_dir=output_dir,
                 output_base_dir=API_OUTPUT_ROOT,
-                skip_size_estimation=False,
+                skip_size_estimation=True,
                 no_extract=False,
                 keep_existing=False,
                 enable_download=True,
@@ -1974,6 +2165,18 @@ def get_notebook_credentials_status(
         ) from exc
 
     return _notebook_credentials_status_payload(row)
+
+
+@app.post(
+    "/api/v1/adenda/notebook/credentials/revalidate",
+    response_model=NotebookCredentialsStatusResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def revalidate_notebook_credentials(
+    user_id: str = Depends(get_current_user_id),
+) -> NotebookCredentialsStatusResponse:
+    """Revalida ahora las cookies NotebookLM guardadas del usuario y actualiza su estado."""
+    return _revalidate_stored_notebook_credentials(user_id)
 
 
 @app.delete(
@@ -2621,7 +2824,7 @@ def create_adenda_notebook(
                 id_adenda=payload.id_adenda,
                 output_dir=output_dir,
                 output_base_dir=API_OUTPUT_ROOT,
-                skip_size_estimation=False,
+                skip_size_estimation=True,
                 no_extract=False,
                 keep_existing=False,
                 enable_download=True,

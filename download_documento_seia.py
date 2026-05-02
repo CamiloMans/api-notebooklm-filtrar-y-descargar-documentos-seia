@@ -89,7 +89,7 @@ BASE_SEIA = "https://seia.sea.gob.cl"
 REQUEST_DELAY_SEC = 1.0
 MAX_RETRIES = 3
 RETRY_BACKOFF_SEC = 5
-CHUNK_SIZE = 8192
+CHUNK_SIZE = 1024 * 1024
 DEFAULT_OUTPUT = Path("./downloads")
 ENABLE_DOWNLOAD = True
 ENABLE_NOTEBOOK_SYNC = True
@@ -2012,8 +2012,8 @@ def build_notebook_upload_filename(item):
     normalized = unicodedata.normalize("NFKD", normalized)
     normalized = normalized.encode("ascii", "ignore").decode("ascii")
     normalized = re.sub(r"\s+", " ", normalized).strip()
-    normalized = normalized.replace(".", "_")
-    normalized = re.sub(r"[ _]+", "_", normalized).strip("_")
+    normalized = normalized.replace(".", "-")
+    normalized = re.sub(r"[ _]+", "_", normalized).strip("_-")
     if not normalized:
         normalized = "archivo"
     return normalized + ext

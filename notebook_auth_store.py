@@ -11,6 +11,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from supabase import Client
 
 NOTEBOOK_CREDENTIALS_TABLE = "notebook_user_credentials"
+NOTEBOOK_CREDENTIALS_EVENTS_TABLE = "notebook_user_credentials_events"
 NOTEBOOK_AUTH_ENCRYPTION_KEY_ENV = "NOTEBOOK_AUTH_ENCRYPTION_KEY"
 _AAD = b"notebook-user-credentials:v1"
 _PREFIX = "v1."
@@ -154,6 +155,58 @@ def list_keepalive_candidates(client: Client) -> List[Dict[str, Any]]:
     return _response_rows(response)
 
 
+def record_credentials_event(
+    client: Client,
+    user_id: str,
+    *,
+    event_type: str,
+    source: str,
+    ok: Optional[bool] = None,
+    status_before: str = "",
+    status_after: str = "",
+    last_error: str = "",
+    duration_ms: Optional[int] = None,
+    cookie_count: Optional[int] = None,
+    failure_count: Optional[int] = None,
+    checked_at: Optional[datetime] = None,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Registra un evento no sensible de credenciales NotebookLM.
+
+    El log es observabilidad: si la tabla aun no existe, no debe romper el flujo principal.
+    """
+    normalized_user_id = (user_id or "").strip()
+    normalized_event_type = (event_type or "").strip()
+    if not normalized_user_id or not normalized_event_type:
+        return None
+
+    row: Dict[str, Any] = {
+        "user_id": normalized_user_id,
+        "event_type": normalized_event_type,
+        "source": (source or "").strip(),
+        "ok": ok,
+        "status_before": (status_before or "").strip(),
+        "status_after": (status_after or "").strip(),
+        "checked_at": iso_utc(checked_at),
+        "last_error": (last_error or "").strip()[:1200],
+        "metadata": metadata or {},
+    }
+    if duration_ms is not None:
+        row["duration_ms"] = max(0, int(duration_ms))
+    if cookie_count is not None:
+        row["cookie_count"] = max(0, int(cookie_count))
+    if failure_count is not None:
+        row["failure_count"] = max(0, int(failure_count))
+
+    try:
+        response = client.table(NOTEBOOK_CREDENTIALS_EVENTS_TABLE).insert(row).execute()
+        rows = _response_rows(response)
+        return rows[0] if rows else row
+    except Exception as exc:  # noqa: BLE001
+        print(f"[notebook-auth] No se pudo registrar evento {normalized_event_type}: {exc}")
+        return None
+
+
 def store_credentials(
     client: Client,
     user_id: str,
@@ -163,12 +216,14 @@ def store_credentials(
     validated_at: Optional[datetime] = None,
     last_checked_at: Optional[datetime] = None,
 ) -> Dict[str, Any]:
+    previous_row = load_credentials(client, user_id)
+    cookie_names = _normalized_cookie_names(payload_dict)
     validated_at_iso = iso_utc(validated_at)
     last_checked_at_iso = iso_utc(last_checked_at or validated_at)
     row = {
         "user_id": user_id,
         "payload_enc": encrypt_payload(payload_dict),
-        "cookie_names": _normalized_cookie_names(payload_dict),
+        "cookie_names": cookie_names,
         "validated_at": validated_at_iso,
         "last_checked_at": last_checked_at_iso,
         "last_used_at": None,
@@ -177,7 +232,20 @@ def store_credentials(
         "failure_count": 0,
     }
     client.table(NOTEBOOK_CREDENTIALS_TABLE).upsert(row, on_conflict="user_id").execute()
-    return load_credentials(client, user_id) or row
+    stored_row = load_credentials(client, user_id) or row
+    record_credentials_event(
+        client,
+        user_id,
+        event_type="store",
+        source="credentials_store",
+        ok=status == "valid",
+        status_before=str((previous_row or {}).get("status") or "missing"),
+        status_after=str(stored_row.get("status") or status),
+        cookie_count=len(cookie_names),
+        failure_count=0,
+        checked_at=parse_timestamp(last_checked_at_iso),
+    )
+    return stored_row
 
 
 def delete_credentials(client: Client, user_id: str) -> bool:
@@ -195,6 +263,11 @@ def mark_credentials_status(
     reset_failure: bool = False,
     last_checked_at: Optional[datetime] = None,
     last_used_at: Optional[datetime] = None,
+    event_type: str = "",
+    event_source: str = "",
+    event_ok: Optional[bool] = None,
+    event_duration_ms: Optional[int] = None,
+    event_cookie_count: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     current_row = load_credentials(client, user_id)
     if not current_row:
@@ -218,7 +291,33 @@ def mark_credentials_status(
         updates["last_used_at"] = iso_utc(last_used_at)
 
     client.table(NOTEBOOK_CREDENTIALS_TABLE).update(updates).eq("user_id", user_id).execute()
-    return load_credentials(client, user_id)
+    updated_row = load_credentials(client, user_id)
+
+    if event_type:
+        cookie_names = (updated_row or current_row).get("cookie_names") or []
+        cookie_count = (
+            event_cookie_count
+            if event_cookie_count is not None
+            else len(cookie_names)
+            if isinstance(cookie_names, list)
+            else None
+        )
+        record_credentials_event(
+            client,
+            user_id,
+            event_type=event_type,
+            source=event_source or event_type,
+            ok=event_ok,
+            status_before=str(current_row.get("status") or "unknown"),
+            status_after=str((updated_row or {}).get("status") or status),
+            last_error=last_error,
+            duration_ms=event_duration_ms,
+            cookie_count=cookie_count,
+            failure_count=failure_count,
+            checked_at=parse_timestamp(updates["last_checked_at"]),
+        )
+
+    return updated_row
 
 
 def touch_last_used(client: Client, user_id: str) -> Optional[Dict[str, Any]]:
@@ -231,6 +330,9 @@ def touch_last_used(client: Client, user_id: str) -> Optional[Dict[str, Any]]:
         reset_failure=True,
         last_checked_at=now,
         last_used_at=now,
+        event_type="operation_success",
+        event_source="notebook_operation",
+        event_ok=True,
     )
 
 
@@ -241,6 +343,8 @@ def record_keepalive_result(
     ok: bool,
     last_error: str = "",
     expired: bool = False,
+    duration_ms: Optional[int] = None,
+    cookie_count: Optional[int] = None,
 ) -> Optional[Dict[str, Any]]:
     now = utcnow()
     if ok:
@@ -251,6 +355,11 @@ def record_keepalive_result(
             last_error="",
             reset_failure=True,
             last_checked_at=now,
+            event_type="keepalive",
+            event_source="keepalive",
+            event_ok=True,
+            event_duration_ms=duration_ms,
+            event_cookie_count=cookie_count,
         )
 
     return mark_credentials_status(
@@ -260,4 +369,9 @@ def record_keepalive_result(
         last_error=last_error,
         increment_failure=True,
         last_checked_at=now,
+        event_type="keepalive",
+        event_source="keepalive",
+        event_ok=False,
+        event_duration_ms=duration_ms,
+        event_cookie_count=cookie_count,
     )

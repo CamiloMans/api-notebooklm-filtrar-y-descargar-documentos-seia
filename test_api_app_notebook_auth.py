@@ -6,9 +6,10 @@ import base64
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi.testclient import TestClient
 
@@ -101,6 +102,152 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
         api_app.API_BEARER_TOKEN = api_app.API_BEARER_TOKEN or "change_me"
         self.client = TestClient(api_app.app)
 
+    def test_validate_cookies_accepts_http_only_netscape_sid(self):
+        raw_cookies = "\n".join(
+            [
+                "#HttpOnly_.google.com\tTRUE\t/\tTRUE\t2147483647\tSID\tsid-http-only",
+                ".google.com\tTRUE\t/\tTRUE\t2147483647\tHSID\thsid-base",
+            ]
+        )
+
+        with patch.object(
+            api_app,
+            "fetch_tokens",
+            AsyncMock(return_value=("csrf-token", "session-id")),
+        ):
+            response = self.client.post(
+                "/auth/validate-cookies",
+                json={"cookies_text": raw_cookies},
+                headers=_headers(include_notebook_auth=False),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["format_detected"], "netscape_text")
+        self.assertTrue(payload["token_fetch_ok"])
+        self.assertEqual(payload["auth_payload"]["cookies"]["SID"], "sid-http-only")
+        self.assertIn("SID", payload["selected_cookie_names"])
+
+    def test_revalidate_stored_credentials_marks_valid_when_tokens_work(self):
+        stored_row = {
+            "user_id": "user-1",
+            "payload_enc": "enc",
+            "status": "expired",
+            "validated_at": "2026-04-27T19:27:19+00:00",
+            "last_checked_at": "2026-04-27T19:56:36+00:00",
+            "last_used_at": None,
+            "cookie_names": ["SID"],
+            "last_error": "login",
+            "failure_count": 1,
+        }
+        updated_row = {
+            **stored_row,
+            "status": "valid",
+            "last_checked_at": "2026-04-27T20:00:00+00:00",
+            "last_error": "",
+            "failure_count": 0,
+        }
+        headers = _headers(include_notebook_auth=False)
+        headers[api_app.NOTEBOOK_USER_JWT_HEADER] = "user-jwt"
+
+        with patch.object(api_app, "_resolve_user_id_from_jwt", return_value="user-1"), patch.object(
+            api_app,
+            "get_supabase_client",
+            return_value=object(),
+        ), patch.object(
+            api_app,
+            "load_credentials",
+            return_value=stored_row,
+        ), patch.object(
+            api_app,
+            "decrypt_payload",
+            return_value={"cookies": {"SID": "sid-base"}},
+        ), patch.object(
+            api_app,
+            "fetch_tokens",
+            AsyncMock(return_value=("csrf-token", "session-id")),
+        ) as fetch_tokens, patch.object(
+            api_app,
+            "mark_credentials_status",
+            return_value=updated_row,
+        ) as mark_status:
+            response = self.client.post(
+                "/api/v1/adenda/notebook/credentials/revalidate",
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["valid"])
+        self.assertEqual(payload["status"], "valid")
+        self.assertEqual(payload["last_error"], "")
+        fetch_tokens.assert_awaited_once()
+        mark_status.assert_called_once()
+        self.assertEqual(mark_status.call_args.kwargs["status"], "valid")
+        self.assertTrue(mark_status.call_args.kwargs["reset_failure"])
+        self.assertEqual(mark_status.call_args.kwargs["event_type"], "revalidate")
+        self.assertTrue(mark_status.call_args.kwargs["event_ok"])
+
+    def test_revalidate_stored_credentials_marks_expired_on_login_failure(self):
+        stored_row = {
+            "user_id": "user-1",
+            "payload_enc": "enc",
+            "status": "valid",
+            "validated_at": "2026-04-27T19:27:19+00:00",
+            "last_checked_at": "2026-04-27T19:27:19+00:00",
+            "last_used_at": None,
+            "cookie_names": ["SID"],
+            "last_error": "",
+            "failure_count": 0,
+        }
+        updated_row = {
+            **stored_row,
+            "status": "expired",
+            "last_checked_at": "2026-04-27T20:00:00+00:00",
+            "last_error": "Redirected to Google login.",
+            "failure_count": 1,
+        }
+        headers = _headers(include_notebook_auth=False)
+        headers[api_app.NOTEBOOK_USER_JWT_HEADER] = "user-jwt"
+
+        with patch.object(api_app, "_resolve_user_id_from_jwt", return_value="user-1"), patch.object(
+            api_app,
+            "get_supabase_client",
+            return_value=object(),
+        ), patch.object(
+            api_app,
+            "load_credentials",
+            return_value=stored_row,
+        ), patch.object(
+            api_app,
+            "decrypt_payload",
+            return_value={"cookies": {"SID": "sid-base"}},
+        ), patch.object(
+            api_app,
+            "fetch_tokens",
+            AsyncMock(side_effect=Exception("Redirected to Google login.")),
+        ), patch.object(
+            api_app,
+            "mark_credentials_status",
+            return_value=updated_row,
+        ) as mark_status:
+            response = self.client.post(
+                "/api/v1/adenda/notebook/credentials/revalidate",
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertFalse(payload["valid"])
+        self.assertEqual(payload["status"], "expired")
+        self.assertIn("Google login", payload["last_error"])
+        mark_status.assert_called_once()
+        self.assertEqual(mark_status.call_args.kwargs["status"], "expired")
+        self.assertTrue(mark_status.call_args.kwargs["increment_failure"])
+        self.assertEqual(mark_status.call_args.kwargs["event_type"], "revalidate")
+        self.assertFalse(mark_status.call_args.kwargs["event_ok"])
+
     def test_create_selection_with_new_notebook_propagates_header_auth(self):
         process_upload = MagicMock(return_value=None)
 
@@ -139,6 +286,76 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
         payload = response.json()
         self.assertEqual(payload["status"], "upload_queued")
         self.assertEqual(process_upload.call_args.args[4]["cookies"]["SID"], "sid-base")
+
+    def test_create_selection_prefers_stored_credentials_over_header_auth(self):
+        process_upload = MagicMock(return_value=None)
+        stored_row = {
+            "user_id": "user-1",
+            "payload_enc": "enc",
+            "status": "valid",
+            "validated_at": "2026-04-28T20:36:56+00:00",
+            "last_checked_at": "2026-04-28T21:12:40+00:00",
+            "last_used_at": None,
+            "cookie_names": ["SID"],
+            "last_error": "",
+            "failure_count": 0,
+        }
+        headers = _headers()
+        headers[api_app.NOTEBOOK_USER_JWT_HEADER] = "user-jwt"
+
+        with patch.object(api_app, "_resolve_user_id_from_jwt", return_value="user-1"), patch.object(
+            api_app,
+            "get_supabase_client",
+            return_value=object(),
+        ), patch.object(
+            api_app,
+            "load_credentials",
+            return_value=stored_row,
+        ), patch.object(
+            api_app,
+            "decrypt_payload",
+            return_value={
+                "version": 1,
+                "cookies": {"SID": "sid-stored"},
+                "cookie_names": ["SID"],
+                "cookie_domains": [".google.com"],
+            },
+        ), patch.object(
+            api_app,
+            "load_run",
+            return_value={"tipo": "ifa", "id_documento": "123", "nombre_notebooklm": ""},
+        ), patch.object(
+            api_app,
+            "load_selected_documents",
+            return_value=[_document_row()],
+        ), patch.object(
+            api_app,
+            "list_notebook_sources",
+            return_value=[],
+        ), patch.object(
+            api_app,
+            "queue_notebook_upload_selection",
+            return_value=None,
+        ), patch.object(
+            api_app,
+            "process_notebook_upload_background",
+            process_upload,
+        ):
+            response = self.client.post(
+                "/api/v1/adenda/crear-y-cargar-notebook-filtrado",
+                json={
+                    "run_id": "run-1",
+                    "nombre_notebook": "Notebook usuario",
+                    "selected_document_ids": ["doc-1"],
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 202)
+        notebook_auth = process_upload.call_args.args[4]
+        self.assertEqual(notebook_auth["cookies"]["SID"], "sid-stored")
+        self.assertEqual(notebook_auth["_credentials_source"], "stored")
+        self.assertEqual(notebook_auth["_credentials_user_id"], "user-1")
 
     def test_create_selection_with_existing_notebook_keeps_notebook_id_and_auth(self):
         process_upload = MagicMock(return_value=None)
@@ -316,6 +533,58 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
             self.assertGreater(len(part_response.content), 0)
             self.assertEqual(part_response.headers["x-zip-export-id"], export_payload["export_id"])
             self.assertTrue(part_response.headers["content-range"].startswith("bytes 0-"))
+
+    def test_selected_documents_zip_uses_windows_safe_entry_names(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "Linea_base" / "archivo_final.pdf"
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(b"documento de prueba")
+
+            row = _document_row("doc-long")
+            row["ruta_relativa"] = "Linea_base/archivo_final.pdf"
+            row["categoria"] = "Relacion con las politicas, planes y programas de desarrollo regional"
+            row["texto_link"] = (
+                "Cap 12 Relacion del Proyecto con las Politicas Planes y Programas "
+                "de Desarrollo Regional y Comunal"
+            )
+            row["nombre_archivo"] = (
+                "Relacion.del.proyecto.con.las.politicas.planes.y.programas.de.desarrollo."
+                "regional.y.comunal.pdf"
+            )
+            duplicate_row = {**row, "id": "doc-long-duplicate"}
+            run = {
+                "id": "run-long",
+                "tipo": "ADENDA",
+                "output_dir": tmp_dir,
+            }
+
+            zip_path = api_app.build_selected_documents_zip(
+                run,
+                [row, duplicate_row],
+                export_id="0123456789abcdef",
+            )
+
+            with zipfile.ZipFile(zip_path, "r") as zip_file:
+                entry_names = [
+                    name
+                    for name in zip_file.namelist()
+                    if name.startswith("documentos_para_notebook/")
+                ]
+
+            self.assertEqual(len(entry_names), 1)
+            entry_name = entry_names[0]
+            file_name = Path(entry_name).name
+            self.assertLessEqual(len(file_name), api_app.ZIP_ENTRY_FILENAME_MAX_CHARS)
+            self.assertTrue(file_name.endswith(".pdf"))
+            self.assertNotRegex(file_name, r"_[0-9a-f]{8}\.pdf$")
+            self.assertNotIn(".", Path(file_name).stem)
+            self.assertIn("-", Path(file_name).stem)
+            self.assertIn("documentos_para_notebook/", entry_name)
+
+            notebook_name = api_app.build_notebook_upload_filename(row)
+            self.assertTrue(notebook_name.endswith(".pdf"))
+            self.assertNotIn(".", Path(notebook_name).stem)
+            self.assertIn("-", Path(notebook_name).stem)
 
     def test_retry_upload_forwards_notebook_auth_to_upload_helper(self):
         fake_supabase = _FakeSupabase(failed_rows=[_document_row()])
