@@ -71,6 +71,7 @@ from notebook_auth_store import (
     parse_timestamp,
     store_credentials,
     touch_last_used,
+    update_cookies,
 )
 
 if load_dotenv:
@@ -2021,6 +2022,27 @@ def process_notebook_upload_background(
                     "" if item.get("uploaded") else str(item.get("error") or ""),
                 )
 
+        rotation_user_id = (
+            (notebook_auth or {}).get("_credentials_user_id")
+            if isinstance(notebook_auth, dict) else None
+        )
+
+        def _persist_rotated_cookies(new_cookies: Dict[str, str]) -> None:
+            if not rotation_user_id or not new_cookies:
+                return
+            try:
+                update_cookies(
+                    client,
+                    str(rotation_user_id),
+                    new_cookies,
+                    event_source="upload_rotation",
+                )
+            except Exception as cb_exc:  # noqa: BLE001
+                print(
+                    f"[notebook-upload] update_cookies fallo para {rotation_user_id}: "
+                    f"{cb_exc}"
+                )
+
         upload_stats = upload_documents_batch_and_single(
             notebook_id=notebook_id,
             docs_report=docs_for_upload,
@@ -2030,6 +2052,9 @@ def process_notebook_upload_background(
             item_callback=_item_progress,
             notebook_auth=notebook_auth,
             auth_seed=auth_seed,
+            cookie_rotation_callback=(
+                _persist_rotated_cookies if rotation_user_id else None
+            ),
         )
 
         not_uploaded_ids = mark_remaining_documents_for_retry(

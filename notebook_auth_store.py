@@ -248,6 +248,48 @@ def store_credentials(
     return stored_row
 
 
+def update_cookies(
+    client: Client,
+    user_id: str,
+    new_cookies: Dict[str, str],
+    *,
+    event_source: str = "cookie_rotation",
+) -> Optional[Dict[str, Any]]:
+    """Mergea cookies rotadas en el payload cifrado del usuario y persiste."""
+    if not new_cookies:
+        return None
+    current = load_credentials(client, user_id)
+    if not current:
+        return None
+    try:
+        payload = decrypt_payload(str(current.get("payload_enc") or ""))
+    except Exception as exc:  # noqa: BLE001
+        print(f"[notebook-auth] No se pudo decifrar payload para rotacion {user_id}: {exc}")
+        return None
+    if not isinstance(payload, dict):
+        return None
+    existing_cookies = payload.get("cookies") or {}
+    if not isinstance(existing_cookies, dict):
+        existing_cookies = {}
+    merged = {**existing_cookies, **{k: v for k, v in new_cookies.items() if v is not None}}
+    if merged == existing_cookies:
+        return current
+    payload["cookies"] = merged
+    stored = store_credentials(client, user_id, payload, status="valid")
+    record_credentials_event(
+        client,
+        user_id,
+        event_type="cookie_rotation",
+        source=event_source,
+        ok=True,
+        status_before=str((current or {}).get("status") or "unknown"),
+        status_after=str((stored or {}).get("status") or "valid"),
+        cookie_count=len(merged),
+        metadata={"rotated_cookie_names": sorted(new_cookies.keys())},
+    )
+    return stored
+
+
 def delete_credentials(client: Client, user_id: str) -> bool:
     client.table(NOTEBOOK_CREDENTIALS_TABLE).delete().eq("user_id", user_id).execute()
     return True

@@ -146,6 +146,10 @@ NOTEBOOK_UPLOAD_VERBOSE_DIAG = os.getenv("NOTEBOOK_UPLOAD_VERBOSE_DIAG", "0").st
     "1", "true", "yes", "on",
 }
 _VERBOSE_DIAG_HEADER_KEEP = ("x-goog-", "content-type", "date", "server", "alt-svc")
+NOTEBOOK_COOKIE_PERSIST_EVERY_N = max(
+    1,
+    int(os.getenv("NOTEBOOK_COOKIE_PERSIST_EVERY_N", "5") or "5"),
+)
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2554,6 +2558,31 @@ def _auth_tokens_from_seed(auth_seed: Dict[str, Any]) -> AuthTokens:
     )
 
 
+def _extract_rotated_cookies(
+    client: NotebookLMClient,
+    baseline: Dict[str, str],
+) -> Dict[str, str]:
+    """Lee cookie jar interno tras un request exitoso y devuelve el diff vs baseline."""
+    core = getattr(client, "_core", None)
+    http = getattr(core, "_http_client", None) if core is not None else None
+    jar_holder = getattr(http, "cookies", None) if http is not None else None
+    raw_jar = getattr(jar_holder, "jar", None) if jar_holder is not None else None
+    if raw_jar is None:
+        return {}
+    rotated: Dict[str, str] = {}
+    try:
+        for cookie in raw_jar:
+            name = getattr(cookie, "name", None)
+            value = getattr(cookie, "value", None)
+            if not name or value is None:
+                continue
+            if baseline.get(name) != value:
+                rotated[name] = value
+    except Exception:  # noqa: BLE001
+        return {}
+    return rotated
+
+
 async def _create_notebook_client_async(
     *,
     notebook_auth: Optional[Dict[str, Any]] = None,
@@ -2713,7 +2742,9 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
                         f"Source subido pero no se pudo renombrar a "
                         f"'{upload_name}': {_notebooklm_error_message(rename_exc)}"
                     )
-        return source, warning
+            baseline_cookies = (current_seed or {}).get("cookies") or {}
+            rotated_cookies = _extract_rotated_cookies(client, baseline_cookies)
+        return source, warning, rotated_cookies
 
     async def _refresh_tokens():
         cookies = (current_seed or {}).get("cookies") or {}
@@ -2732,7 +2763,7 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
         attempts_done = attempt
         try:
-            source, warning = asyncio.run(_upload())
+            source, warning, rotated_cookies = asyncio.run(_upload())
             elapsed = time.perf_counter() - started
             return {
                 **base_item,
@@ -2743,6 +2774,7 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
                 "response_body": {"ok": True, "item": _source_payload(source)},
                 "elapsed_seconds": round(elapsed, 2),
                 "attempts": attempts_done,
+                "rotated_cookies": rotated_cookies or {},
             }
         except (FileNotFoundError, ValidationError, AuthError) as e:
             last_error = e
@@ -2808,6 +2840,7 @@ def upload_documents_batch_and_single(
     item_callback=None,
     notebook_auth=None,
     auth_seed=None,
+    cookie_rotation_callback: Optional[Callable[[Dict[str, str]], None]] = None,
 ):
     """
     Carga archivos al notebook en paralelo acotado usando notebooklm-py.
@@ -2904,6 +2937,7 @@ def upload_documents_batch_and_single(
         future_map[future] = (order, doc)
 
     credentials_expired_exc: Optional[NotebookCredentialsExpired] = None
+    pending_rotation: Dict[str, str] = {}
 
     with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
         pending_iterator = iter(list(enumerate(selected, 1)))
@@ -2932,6 +2966,30 @@ def upload_documents_batch_and_single(
                 completed_count += 1
                 if item.get("uploaded"):
                     uploaded_ok += 1
+                rotated_from_item = item.get("rotated_cookies") or {}
+                if isinstance(rotated_from_item, dict) and rotated_from_item:
+                    pending_rotation.update(rotated_from_item)
+                    if isinstance(resolved_auth_seed, dict):
+                        seed_cookies = resolved_auth_seed.get("cookies")
+                        if isinstance(seed_cookies, dict):
+                            seed_cookies.update(rotated_from_item)
+                if (
+                    cookie_rotation_callback is not None
+                    and pending_rotation
+                    and completed_count % NOTEBOOK_COOKIE_PERSIST_EVERY_N == 0
+                ):
+                    try:
+                        cookie_rotation_callback(dict(pending_rotation))
+                        print(
+                            f"      [cookies persistidas] {len(pending_rotation)} "
+                            f"cookie(s) rotada(s) tras {completed_count} archivo(s)"
+                        )
+                        pending_rotation = {}
+                    except Exception as cb_exc:  # noqa: BLE001
+                        print(
+                            f"      [cookie rotation callback fallo: "
+                            f"{type(cb_exc).__name__}: {cb_exc}]"
+                        )
                 upload_items.append(item)
 
                 upload_name = str(item.get("nombre_archivo_notebook") or "")
@@ -2970,6 +3028,20 @@ def upload_documents_batch_and_single(
                     item_callback("completed", item, completed_count, total_selected)
 
                 _submit_next(executor, pending_iterator)
+
+    if cookie_rotation_callback is not None and pending_rotation:
+        try:
+            cookie_rotation_callback(dict(pending_rotation))
+            print(
+                f"      [cookies persistidas final] {len(pending_rotation)} "
+                f"cookie(s) rotada(s) al cierre"
+            )
+            pending_rotation = {}
+        except Exception as cb_exc:  # noqa: BLE001
+            print(
+                f"      [cookie rotation callback final fallo: "
+                f"{type(cb_exc).__name__}: {cb_exc}]"
+            )
 
     uploaded_failed = max(0, len(selected) - uploaded_ok)
     upload_items.sort(key=lambda item: item.get("_order", 0))
