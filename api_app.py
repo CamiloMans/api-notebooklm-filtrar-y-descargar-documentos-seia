@@ -991,6 +991,13 @@ def _normalize_storage_state_from_text(raw_text: str) -> tuple[Dict[str, Any], s
     )
 
 
+REQUIRED_AUTH_COOKIE_GROUPS: tuple[frozenset[str], ...] = (
+    frozenset({"SID"}),
+    frozenset({"__Secure-1PSID"}),
+    frozenset({"__Secure-3PSID"}),
+)
+
+
 def _select_auth_cookies_from_storage(
     storage_state: Dict[str, Any],
 ) -> tuple[Dict[str, str], Dict[str, str], List[str]]:
@@ -1013,7 +1020,12 @@ def _select_auth_cookies_from_storage(
             cookies[name] = value
             cookie_domains[name] = domain
 
-    missing_required = sorted(MINIMUM_REQUIRED_COOKIES - set(cookies.keys()))
+    cookie_names = set(cookies.keys())
+    if any(group <= cookie_names for group in REQUIRED_AUTH_COOKIE_GROUPS):
+        missing_required: List[str] = []
+    else:
+        flat = sorted({name for group in REQUIRED_AUTH_COOKIE_GROUPS for name in group})
+        missing_required = [" o ".join(flat)]
     return cookies, cookie_domains, missing_required
 
 
