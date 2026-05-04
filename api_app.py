@@ -997,24 +997,9 @@ REQUIRED_AUTH_COOKIE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"__Secure-3PSID"}),
 )
 
-EXTRA_AUTH_DOMAIN_SUFFIXES: tuple[str, ...] = (
-    "accounts.google.com",
-    "myaccount.google.com",
-    "notebooklm.google.com",
-    "ogs.google.com",
-)
-
-
 def _is_allowed_auth_domain_extended(domain: str) -> bool:
-    """Acepta los dominios admitidos por la lib + subdominios criticos de auth Google."""
-    if not domain:
-        return False
-    if _is_allowed_auth_domain(domain):
-        return True
-    bare = domain.lstrip(".").lower()
-    if bare in EXTRA_AUTH_DOMAIN_SUFFIXES:
-        return True
-    return any(bare.endswith("." + suffix) for suffix in EXTRA_AUTH_DOMAIN_SUFFIXES)
+    """Acepta los dominios admitidos por la lib (mantenido para hooks futuros)."""
+    return _is_allowed_auth_domain(domain)
 
 
 def _select_auth_cookies_from_storage(
