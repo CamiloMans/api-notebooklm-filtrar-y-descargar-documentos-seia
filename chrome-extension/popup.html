@@ -1,0 +1,85 @@
+<!doctype html>
+<html lang="es">
+  <head>
+    <meta charset="utf-8" />
+    <title>Myma NotebookLM Cookie Sync</title>
+    <style>
+      body {
+        font-family: -apple-system, system-ui, "Segoe UI", sans-serif;
+        font-size: 13px;
+        padding: 12px;
+        width: 380px;
+        margin: 0;
+      }
+      h3 { margin: 0 0 4px; }
+      label { display: block; margin-top: 10px; font-weight: 600; }
+      input[type="text"],
+      input[type="password"],
+      input[type="number"] {
+        width: 100%;
+        padding: 5px 7px;
+        box-sizing: border-box;
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+        font-size: 12px;
+      }
+      .row { margin-top: 12px; display: flex; gap: 8px; flex-wrap: wrap; }
+      button {
+        padding: 6px 10px;
+        cursor: pointer;
+        font-size: 12px;
+      }
+      .ok { color: #0a7d28; margin-top: 8px; }
+      .err {
+        color: #b00020;
+        margin-top: 8px;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+      .muted { color: #666; font-size: 11px; }
+      .resp {
+        margin-top: 8px;
+        font-size: 11px;
+        color: #444;
+        background: #f4f4f4;
+        padding: 6px;
+        border-radius: 4px;
+        max-height: 120px;
+        overflow: auto;
+        white-space: pre-wrap;
+        word-break: break-all;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>Myma NotebookLM Cookie Sync</h3>
+    <div class="muted">
+      Lee cookies de Google del browser actual y las envia al backend Myma para mantener viva la sesion NotebookLM. Asegurate de tener sesion activa en
+      <code>accounts.google.com</code> con la cuenta correcta.
+    </div>
+
+    <label>Backend URL</label>
+    <input id="backendUrl" type="text" placeholder="https://api.tu-dominio" />
+
+    <label>API Bearer Token</label>
+    <input id="bearerToken" type="password" placeholder="API_BEARER_TOKEN" />
+
+    <label>User JWT (Supabase access_token)</label>
+    <input id="userJwt" type="password" placeholder="eyJ..." />
+
+    <label>Intervalo de sync (min)</label>
+    <input id="intervalMin" type="number" min="1" max="60" value="10" />
+
+    <div class="row">
+      <button id="save">Guardar</button>
+      <button id="grantHosts">Permitir host backend</button>
+      <button id="syncNow">Sync ahora</button>
+    </div>
+
+    <div class="ok" id="lastOk"></div>
+    <div class="err" id="lastErr"></div>
+    <div class="muted">Ultimo sync: <span id="lastSync">nunca</span></div>
+    <div class="resp" id="lastResponse"></div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>
