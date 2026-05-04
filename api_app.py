@@ -997,6 +997,25 @@ REQUIRED_AUTH_COOKIE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"__Secure-3PSID"}),
 )
 
+EXTRA_AUTH_DOMAIN_SUFFIXES: tuple[str, ...] = (
+    "accounts.google.com",
+    "myaccount.google.com",
+    "notebooklm.google.com",
+    "ogs.google.com",
+)
+
+
+def _is_allowed_auth_domain_extended(domain: str) -> bool:
+    """Acepta los dominios admitidos por la lib + subdominios criticos de auth Google."""
+    if not domain:
+        return False
+    if _is_allowed_auth_domain(domain):
+        return True
+    bare = domain.lstrip(".").lower()
+    if bare in EXTRA_AUTH_DOMAIN_SUFFIXES:
+        return True
+    return any(bare.endswith("." + suffix) for suffix in EXTRA_AUTH_DOMAIN_SUFFIXES)
+
 
 def _select_auth_cookies_from_storage(
     storage_state: Dict[str, Any],
@@ -1012,7 +1031,7 @@ def _select_auth_cookies_from_storage(
         domain = str(cookie.get("domain", "")).strip()
         name = str(cookie.get("name", "")).strip()
         value = str(cookie.get("value", ""))
-        if not _is_allowed_auth_domain(domain) or not name or not value:
+        if not _is_allowed_auth_domain_extended(domain) or not name or not value:
             continue
 
         is_base_domain = domain == ".google.com"
@@ -1035,7 +1054,7 @@ def _allowed_cookie_domains_from_storage(storage_state: Dict[str, Any]) -> List[
         str(cookie.get("domain", "")).strip()
         for cookie in storage_state.get("cookies", [])
         if isinstance(cookie, dict)
-        and _is_allowed_auth_domain(str(cookie.get("domain", "")).strip())
+        and _is_allowed_auth_domain_extended(str(cookie.get("domain", "")).strip())
     }
     return sorted(domain for domain in domains if domain)
 
