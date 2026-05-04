@@ -4,7 +4,8 @@ async function loadIntoForm() {
   const data = await chrome.storage.local.get([
     'backendUrl',
     'bearerToken',
-    'userJwt',
+    'refreshToken',
+    'accessTokenExpiresAt',
     'intervalMin',
     'lastSync',
     'lastError',
@@ -12,7 +13,7 @@ async function loadIntoForm() {
   ]);
   $('backendUrl').value = data.backendUrl || '';
   $('bearerToken').value = data.bearerToken || '';
-  $('userJwt').value = data.userJwt || '';
+  $('refreshToken').value = data.refreshToken || '';
   $('intervalMin').value = data.intervalMin || 10;
   $('lastSync').textContent = data.lastSync || 'nunca';
   $('lastErr').textContent = data.lastError ? `Ultimo error: ${data.lastError}` : '';
@@ -21,12 +22,19 @@ async function loadIntoForm() {
 
 async function save() {
   const intervalMin = Math.max(1, Math.min(60, Number($('intervalMin').value) || 10));
-  await chrome.storage.local.set({
+  const newRefresh = $('refreshToken').value.trim();
+  const update = {
     backendUrl: $('backendUrl').value.trim(),
     bearerToken: $('bearerToken').value.trim(),
-    userJwt: $('userJwt').value.trim(),
+    refreshToken: newRefresh,
     intervalMin,
-  });
+  };
+  const previous = await chrome.storage.local.get(['refreshToken']);
+  if ((previous.refreshToken || '') !== newRefresh) {
+    update.accessToken = '';
+    update.accessTokenExpiresAt = 0;
+  }
+  await chrome.storage.local.set(update);
   await chrome.runtime.sendMessage({ type: 'set_interval', intervalMin });
   $('lastOk').textContent = 'Guardado.';
   setTimeout(() => ($('lastOk').textContent = ''), 1500);

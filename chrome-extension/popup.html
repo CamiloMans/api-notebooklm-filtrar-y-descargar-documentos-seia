@@ -63,8 +63,9 @@
     <label>API Bearer Token</label>
     <input id="bearerToken" type="password" placeholder="API_BEARER_TOKEN" />
 
-    <label>User JWT (Supabase access_token)</label>
-    <input id="userJwt" type="password" placeholder="eyJ..." />
+    <label>Supabase refresh_token (long-lived)</label>
+    <input id="refreshToken" type="password" placeholder="ej. v1.abcde..." />
+    <div class="muted">El backend cambia el refresh_token por un access_token fresco antes de cada sync.</div>
 
     <label>Intervalo de sync (min)</label>
     <input id="intervalMin" type="number" min="1" max="60" value="10" />

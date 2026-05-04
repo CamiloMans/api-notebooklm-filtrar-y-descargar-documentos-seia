@@ -14,6 +14,8 @@ import threading
 import unicodedata
 import uuid
 import zipfile
+
+import httpx
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -422,6 +424,22 @@ class NotebookCredentialsStatusResponse(BaseModel):
 
 class NotebookCredentialsDeleteResponse(BaseModel):
     deleted: bool
+
+
+class SupabaseRefreshTokenRequest(BaseModel):
+    refresh_token: str = Field(
+        ...,
+        min_length=1,
+        description="Supabase refresh_token del usuario para obtener un access_token fresco.",
+    )
+
+
+class SupabaseRefreshTokenResponse(BaseModel):
+    access_token: str
+    refresh_token: str
+    expires_at: Optional[int] = None
+    expires_in: Optional[int] = None
+    token_type: Optional[str] = None
 
 
 @asynccontextmanager
@@ -2262,6 +2280,73 @@ def revalidate_notebook_credentials(
 ) -> NotebookCredentialsStatusResponse:
     """Revalida ahora las cookies NotebookLM guardadas del usuario y actualiza su estado."""
     return _revalidate_stored_notebook_credentials(user_id)
+
+
+@app.post(
+    "/api/v1/adenda/auth/refresh",
+    response_model=SupabaseRefreshTokenResponse,
+    dependencies=[Depends(require_bearer_token)],
+)
+def refresh_user_access_token(body: SupabaseRefreshTokenRequest) -> SupabaseRefreshTokenResponse:
+    """Intercambia un refresh_token Supabase por un access_token nuevo + refresh_token rotado."""
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="SUPABASE_URL/SUPABASE_KEY no configurados en el backend.",
+        )
+    refresh_token = (body.refresh_token or "").strip()
+    if not refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="refresh_token vacio.",
+        )
+    url = SUPABASE_URL.rstrip("/") + "/auth/v1/token?grant_type=refresh_token"
+    try:
+        with httpx.Client(timeout=15.0) as http_client:
+            response = http_client.post(
+                url,
+                headers={
+                    "apikey": SUPABASE_KEY,
+                    "Authorization": f"Bearer {SUPABASE_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={"refresh_token": refresh_token},
+            )
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Refresh hacia Supabase fallo: {exc}",
+        ) from exc
+
+    if response.status_code != 200:
+        raise HTTPException(
+            status_code=response.status_code,
+            detail=f"Supabase rechazo el refresh ({response.status_code}): {response.text[:400]}",
+        )
+
+    try:
+        data = response.json()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=f"Respuesta Supabase no parseable: {exc}",
+        ) from exc
+
+    access_token = str(data.get("access_token") or "").strip()
+    new_refresh_token = str(data.get("refresh_token") or "").strip()
+    if not access_token or not new_refresh_token:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Supabase no devolvio access_token o refresh_token.",
+        )
+
+    return SupabaseRefreshTokenResponse(
+        access_token=access_token,
+        refresh_token=new_refresh_token,
+        expires_at=data.get("expires_at"),
+        expires_in=data.get("expires_in"),
+        token_type=data.get("token_type"),
+    )
 
 
 @app.delete(

@@ -43,9 +43,13 @@ fresco.
    - **Backend URL** — ej. `https://api.tu-dominio` (sin `/` final).
    - **API Bearer Token** — el `API_BEARER_TOKEN` del backend (mismo que usa
      el resto de la API Myma).
-   - **User JWT** — `access_token` Supabase del usuario duenno de las
-     credenciales (se obtiene desde la sesion en `apps/web` o desde
-     `supabase.auth.getSession()` en consola).
+   - **Supabase refresh_token** — el `refresh_token` (no el access_token) del
+     usuario duenno de las credenciales. La extension lo intercambia por un
+     `access_token` fresco contra `POST /api/v1/adenda/auth/refresh` antes de
+     cada sync, asi no hay que repegar nada cuando el access_token expira a la
+     hora. Para sacarlo: en `apps/web` logueado, DevTools → Application →
+     Local Storage → key `sb-<ref>-auth-token` → field `refresh_token`. O en
+     consola: `(await window.supabase.auth.getSession()).data.session.refresh_token`.
    - **Intervalo (min)** — default 10. Bajar a 5 si quieres mas frecuencia.
 4. Click **Guardar**.
 5. Click **Permitir host backend** y aceptar el prompt de Chrome (para que la
