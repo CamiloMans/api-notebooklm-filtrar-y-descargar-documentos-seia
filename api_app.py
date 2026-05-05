@@ -560,7 +560,7 @@ def _notebook_credentials_status_payload(
     normalized_status = str(row.get("status") or "").strip() or "unknown"
     return NotebookCredentialsStatusResponse(
         has_credentials=True,
-        valid=normalized_status == "valid",
+        valid=normalized_status in ("valid", "needs_validation"),
         status=normalized_status,
         validated_at=_row_timestamp_to_iso(row.get("validated_at")),
         last_checked_at=_row_timestamp_to_iso(row.get("last_checked_at")),
