@@ -81,6 +81,17 @@
     <div class="muted">Ultimo sync: <span id="lastSync">nunca</span></div>
     <div class="resp" id="lastResponse"></div>
 
+    <hr style="margin-top:14px" />
+    <div class="muted">
+      <strong>Integracion con apps/web:</strong> usa este Extension ID en tu
+      pagina (<code>chrome.runtime.sendMessage</code>) para configurar la
+      extension automaticamente sin pegar nada.
+    </div>
+    <div class="row">
+      <input id="extensionId" type="text" readonly />
+      <button id="copyExtId">Copiar</button>
+    </div>
+
     <script src="popup.js"></script>
   </body>
 </html>

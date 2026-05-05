@@ -1,4 +1,6 @@
 .claude/
+chrome-extension/extension-key.pem
+chrome-extension/pubkey.b64
 __pycache__/
 *.pyc
 *.pyo

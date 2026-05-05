@@ -84,9 +84,26 @@ async function grantHosts() {
   }
 }
 
+function showExtensionId() {
+  const id = chrome.runtime.id;
+  $('extensionId').value = id;
+}
+
+async function copyExtId() {
+  try {
+    await navigator.clipboard.writeText($('extensionId').value);
+    $('lastOk').textContent = 'Extension ID copiado.';
+    setTimeout(() => ($('lastOk').textContent = ''), 1500);
+  } catch (err) {
+    $('lastErr').textContent = `Copy fallo: ${err && err.message}`;
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
   loadIntoForm();
+  showExtensionId();
   $('save').addEventListener('click', save);
   $('syncNow').addEventListener('click', syncNow);
   $('grantHosts').addEventListener('click', grantHosts);
+  $('copyExtId').addEventListener('click', copyExtId);
 });

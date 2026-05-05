@@ -244,3 +244,89 @@ chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     return true;
   }
 });
+
+const ALLOWED_EXTERNAL_ORIGINS = [
+  /^https:\/\/aplicaciones-myma\.onrender\.com$/,
+  /^https:\/\/app\.myma\.cl$/,
+  /^https:\/\/[a-z0-9-]+\.myma\.cl$/,
+  /^http:\/\/localhost:(3001|5173)$/,
+  /^http:\/\/127\.0\.0\.1:(3001|5173)$/,
+];
+
+function isAllowedExternalOrigin(origin) {
+  if (!origin) return false;
+  return ALLOWED_EXTERNAL_ORIGINS.some((re) => re.test(origin));
+}
+
+async function applyExternalConfig(payload) {
+  const config = payload && typeof payload === 'object' ? payload : {};
+  const update = {};
+  if (typeof config.backendUrl === 'string') update.backendUrl = config.backendUrl.trim();
+  if (typeof config.bearerToken === 'string') update.bearerToken = config.bearerToken.trim();
+  if (typeof config.intervalMin !== 'undefined') {
+    const n = Math.max(1, Math.min(60, Number(config.intervalMin) || 10));
+    update.intervalMin = n;
+  }
+  if (typeof config.refreshToken === 'string' && config.refreshToken.trim()) {
+    const previous = await chrome.storage.local.get(['refreshToken']);
+    update.refreshToken = config.refreshToken.trim();
+    if ((previous.refreshToken || '') !== update.refreshToken) {
+      update.accessToken = '';
+      update.accessTokenExpiresAt = 0;
+    }
+  }
+  if (Object.keys(update).length === 0) {
+    return { changed: false };
+  }
+  await chrome.storage.local.set(update);
+  if (typeof update.intervalMin !== 'undefined') {
+    await setupAlarm(update.intervalMin);
+  }
+  return { changed: true, fields: Object.keys(update) };
+}
+
+chrome.runtime.onMessageExternal.addListener((msg, sender, sendResponse) => {
+  const origin = sender && sender.origin ? String(sender.origin) : '';
+  if (!isAllowedExternalOrigin(origin)) {
+    sendResponse({ ok: false, error: `Origen no autorizado: ${origin}` });
+    return false;
+  }
+
+  if (msg && msg.type === 'ping') {
+    sendResponse({ ok: true, version: chrome.runtime.getManifest().version });
+    return false;
+  }
+
+  if (msg && msg.type === 'configure') {
+    applyExternalConfig(msg.config || msg)
+      .then((result) => sendResponse({ ok: true, ...result }))
+      .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+    return true;
+  }
+
+  if (msg && msg.type === 'sync_now') {
+    syncNow()
+      .then((body) => sendResponse({ ok: true, body: String(body || '').slice(0, 1000) }))
+      .catch((err) => sendResponse({ ok: false, error: String((err && err.message) || err) }));
+    return true;
+  }
+
+  if (msg && msg.type === 'get_status') {
+    loadConfig().then((cfg) => {
+      const safe = {
+        backendUrl: cfg.backendUrl,
+        intervalMin: cfg.intervalMin,
+        lastSync: cfg.lastSync,
+        lastError: cfg.lastError,
+        hasBearer: Boolean(cfg.bearerToken),
+        hasRefreshToken: Boolean(cfg.refreshToken),
+        accessTokenExpiresAt: cfg.accessTokenExpiresAt || 0,
+      };
+      sendResponse({ ok: true, status: safe });
+    });
+    return true;
+  }
+
+  sendResponse({ ok: false, error: 'Tipo de mensaje desconocido.' });
+  return false;
+});

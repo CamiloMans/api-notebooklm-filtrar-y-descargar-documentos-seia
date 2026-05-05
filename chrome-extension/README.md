@@ -78,6 +78,93 @@ limit 20;
 Si la sesion se mantiene viva, `__Secure-1PSIDTS` debe cambiar entre sync
 sucesivos en `payload_enc.cookies` de `notebook_user_credentials`.
 
+## Integracion con apps/web (auto-config sin pegar nada)
+
+La extension acepta mensajes de orígenes confiables vía
+`chrome.runtime.sendMessage` con un Extension ID estable. Esto permite que
+`apps/web` envíe la configuración de un solo click, sin que el usuario tenga
+que copiar bearer/URL/refresh_token al popup.
+
+**Extension ID estable:** `klgfnedjofnmlcfkndbehjhpbbahdnhc`
+
+(El ID es fijo gracias al campo `key` en `manifest.json`. No cambia entre
+instalaciones del mismo unpacked.)
+
+**Origenes autorizados** (ver `externally_connectable.matches` y la
+allowlist en `background.js`):
+
+- `https://aplicaciones-myma.onrender.com`
+- `https://app.myma.cl` y `https://*.myma.cl`
+- `http://localhost:3001` / `http://localhost:5173`
+- `http://127.0.0.1:3001` / `http://127.0.0.1:5173`
+
+### Snippet para apps/web
+
+```ts
+const EXTENSION_ID = 'klgfnedjofnmlcfkndbehjhpbbahdnhc';
+const BACKEND_URL = 'http://34.74.6.124';
+const API_BEARER_TOKEN = import.meta.env.VITE_NOTEBOOK_LM_LOCAL_API_BEARER_TOKEN;
+
+async function configureNotebookExtension() {
+  const session = (await window.supabase.auth.getSession()).data.session;
+  if (!session) throw new Error('No hay sesion Supabase activa.');
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      EXTENSION_ID,
+      {
+        type: 'configure',
+        config: {
+          backendUrl: BACKEND_URL,
+          bearerToken: API_BEARER_TOKEN,
+          refreshToken: session.refresh_token,
+          intervalMin: 10,
+        },
+      },
+      (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err) return reject(err);
+        if (!resp || !resp.ok) return reject(new Error(resp && resp.error || 'configure fallo'));
+        resolve(resp);
+      },
+    );
+  });
+}
+
+async function syncNotebookExtension() {
+  return new Promise((resolve, reject) => {
+    chrome.runtime.sendMessage(
+      EXTENSION_ID,
+      { type: 'sync_now' },
+      (resp) => {
+        const err = chrome.runtime.lastError;
+        if (err) return reject(err);
+        if (!resp || !resp.ok) return reject(new Error(resp && resp.error || 'sync fallo'));
+        resolve(resp);
+      },
+    );
+  });
+}
+```
+
+### Tipos de mensaje aceptados
+
+- `{type: 'ping'}` → `{ok: true, version}` (chequea install).
+- `{type: 'configure', config: {...}}` → guarda backendUrl, bearerToken,
+  refreshToken, intervalMin. Reinicia alarma. Limpia access_token cacheado si
+  cambia el refresh_token.
+- `{type: 'sync_now'}` → ejecuta sync inmediato.
+- `{type: 'get_status'}` → devuelve estado seguro (sin valores de tokens, solo
+  banderas `hasBearer`/`hasRefreshToken` + lastSync/lastError).
+
+### UX recomendada en apps/web
+
+1. Botón **"Configurar extension Myma"** en `apps/web` que:
+   - Detecta extension via `ping`.
+   - Si no instalada: muestra link al README de instalación.
+   - Si instalada: llama `configure` + `sync_now` y muestra status.
+2. Banner permanente en la página NotebookLM Myma que indica si la última
+   sync fue OK (via `get_status`).
+
 ## Permisos
 
 - `cookies` — leer cookies de Google.
