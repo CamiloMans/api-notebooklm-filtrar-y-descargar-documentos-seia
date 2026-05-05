@@ -767,7 +767,7 @@ def get_notebook_auth_payload(
 
         if credentials_row:
             status_value = str(credentials_row.get("status") or "").strip()
-            if status_value == "valid":
+            if status_value in ("valid", "needs_validation"):
                 try:
                     payload = decrypt_payload(str(credentials_row.get("payload_enc") or ""))
                 except ValueError as exc:
@@ -2253,14 +2253,37 @@ def store_notebook_credentials(
                 ),
             )
 
-        asyncio.run(fetch_tokens(dict(auth_payload["cookies"])))
-        row = store_credentials(get_supabase_client(), user_id, auth_payload)
+        token_fetch_ok = False
+        token_fetch_error: str = ""
+        try:
+            asyncio.run(fetch_tokens(dict(auth_payload["cookies"])))
+            token_fetch_ok = True
+        except Exception as fetch_exc:  # noqa: BLE001
+            token_fetch_error = str(fetch_exc).strip() or fetch_exc.__class__.__name__
+
+        client = get_supabase_client()
+        row = store_credentials(
+            client,
+            user_id,
+            auth_payload,
+            status="valid" if token_fetch_ok else "needs_validation",
+        )
+        if not token_fetch_ok:
+            row = mark_credentials_status(
+                client,
+                user_id,
+                status="needs_validation",
+                last_error=f"fetch_tokens fallo (cookies guardadas igual): {token_fetch_error}",
+                event_type="store_token_fetch_failed",
+                event_source="credentials_store",
+                event_ok=False,
+            ) or row
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail=str(exc).strip() or "No se pudieron validar/guardar las credenciales NotebookLM.",
+            detail=str(exc).strip() or "No se pudieron guardar las credenciales NotebookLM.",
         ) from exc
 
     return _notebook_credentials_status_payload(row)
