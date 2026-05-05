@@ -2515,8 +2515,10 @@ def _normalize_notebook_auth_payload(
         if name and value:
             cookies[name] = value
 
-    if "SID" not in cookies:
-        raise NotebookAPIError("El payload de auth de NotebookLM no incluye la cookie SID.")
+    if not any(name in cookies for name in ("SID", "__Secure-1PSID", "__Secure-3PSID")):
+        raise NotebookAPIError(
+            "El payload de auth de NotebookLM no incluye SID ni __Secure-1PSID/__Secure-3PSID."
+        )
 
     return {
         "version": 1,

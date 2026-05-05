@@ -224,8 +224,10 @@ def decode_notebook_auth_header_value(raw_value: str) -> Dict[str, Any]:
         if name and value:
             cookies[name] = value
 
-    if "SID" not in cookies:
-        raise ValueError(f"{NOTEBOOK_AUTH_HEADER} no incluye la cookie SID.")
+    if not any(name in cookies for name in ("SID", "__Secure-1PSID", "__Secure-3PSID")):
+        raise ValueError(
+            f"{NOTEBOOK_AUTH_HEADER} no incluye SID ni __Secure-1PSID/__Secure-3PSID."
+        )
 
     return {
         "version": 1,
