@@ -1,11 +1,14 @@
 {
   "manifest_version": 3,
   "name": "Myma NotebookLM Cookie Sync",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Sincroniza cookies de Google del browser al backend Myma para mantener viva la sesion NotebookLM sin re-pegar cookies manualmente.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA5POpM47CkzVDH+vrpq2YUrDoRUqlm4cvWX4IwDTcQnEq7BS7Jd5x99C/ysTeI6eYAHpI9+dICVqJ4JXz4EoxDivOAsw4nO/7W2Pm0gGBxhlkg/53mxTEmAhFjMB8vi3vq5/ZHrMx+dJvlRRD2uM5CWGAfKDhtJNk9V4M1Ny6hvIrIYRqKQiatqimbYgftSS3wNYhpx9gHVTNSODnZav8TJMuER0B3IyERViBdHJ4LeWCPEf8xUq+cyO52sMo7OOjuRLmH7UJkq9Yfdy2x0K7LFWcWq+fLxY2IjexOXmOXErESio0ztT+CswiSozfpRJLzrNPFDzx5t7retT6L9Bs0QIDAQAB",
   "permissions": ["cookies", "alarms", "storage"],
-  "host_permissions": ["https://*.google.com/*"],
+  "host_permissions": [
+    "https://*.google.com/*",
+    "http://34.74.6.124/*"
+  ],
   "optional_host_permissions": ["https://*/*", "http://*/*"],
   "externally_connectable": {
     "matches": [
