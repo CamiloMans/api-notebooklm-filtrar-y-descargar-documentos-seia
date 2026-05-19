@@ -157,6 +157,14 @@ NOTEBOOK_UPLOAD_RETRY_ATTEMPTS = max(
 NOTEBOOK_UPLOAD_RETRY_BASE_SEC = float(
     os.getenv("NOTEBOOK_UPLOAD_RETRY_BASE_SEC", "5") or "5"
 )
+NOTEBOOK_UPLOAD_FILENAME_MAX_LEN = max(
+    40,
+    int(os.getenv("NOTEBOOK_UPLOAD_FILENAME_MAX_LEN", "140") or "140"),
+)
+NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN = max(
+    40,
+    int(os.getenv("NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN", "80") or "80"),
+)
 NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC = float(
     os.getenv("NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC", "0.6") or "0.6"
 )
@@ -232,6 +240,20 @@ def shorten_with_hash(text, maxlen):
     digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:8]
     keep = max(1, maxlen - len(digest) - 1)
     return f"{text[:keep]}_{digest}"
+
+
+def shorten_with_hash_middle(text, maxlen):
+    """Recorta conservando inicio y cola, con hash corto para estabilidad."""
+    text = (text or "").strip()
+    if maxlen <= 0:
+        return ""
+    if len(text) <= maxlen:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    budget = max(2, maxlen - len(digest) - 2)
+    head_keep = max(1, budget // 2)
+    tail_keep = max(1, budget - head_keep)
+    return f"{text[:head_keep]}_{text[-tail_keep:]}_{digest}"
 
 
 def compact_component(name, maxlen=80):
@@ -2298,7 +2320,44 @@ def build_notebook_upload_filename(item):
     normalized = re.sub(r"[ _]+", "_", normalized).strip("_-")
     if not normalized:
         normalized = "archivo"
+    max_stem_len = max(1, NOTEBOOK_UPLOAD_FILENAME_MAX_LEN - len(ext))
+    normalized = shorten_with_hash_middle(normalized, maxlen=max_stem_len)
     return normalized + ext
+
+
+def build_notebook_upload_staging_filename(upload_name, fallback_name="archivo.pdf"):
+    """Construye nombre fisico corto para el multipart inicial de NotebookLM."""
+    upload_name = str(upload_name or "")
+    fallback_name = str(fallback_name or "archivo.pdf")
+    ext = Path(upload_name).suffix.lower() or Path(fallback_name).suffix.lower() or ".pdf"
+    stem = Path(upload_name).stem or Path(fallback_name).stem or "archivo"
+    normalized = unicodedata.normalize("NFKD", stem)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    for char in '<>:"/\\|?*':
+        normalized = normalized.replace(char, "_")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = normalized.replace(".", "-")
+    normalized = re.sub(r"[ _]+", "_", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("._-")
+    if not normalized:
+        normalized = "archivo"
+    max_stem_len = max(1, NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN - len(ext))
+    return shorten_with_hash_middle(normalized, maxlen=max_stem_len) + ext
+
+
+def prepare_notebook_upload_staging_file(source_path, upload_name):
+    """
+    Copia el archivo a una ruta temporal corta para que NotebookLM reciba
+    un filename simple en el multipart inicial. El caller borra stage_dir.
+    """
+    import tempfile
+
+    source_path = Path(source_path)
+    staging_name = build_notebook_upload_staging_filename(upload_name, source_path.name)
+    stage_dir = Path(tempfile.mkdtemp(prefix="notebook_upload_"))
+    stage_path = stage_dir / staging_name
+    shutil.copy2(_long_path(source_path), _long_path(stage_path))
+    return stage_path, stage_dir
 
 
 def rename_final_pdf_documents(output_dir, docs):
@@ -2975,6 +3034,8 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     upload_name = str(
         doc.get("nombre_archivo_notebook") or build_notebook_upload_filename(doc)
     )
+    upload_path = p
+    stage_dir = None
     base_item = {
         "_order": order,
         "document_id": doc.get("document_id"),
@@ -2992,6 +3053,15 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
         return {**base_item, "error": f"No existe archivo: {p}", "attempts": 0}
 
     current_seed = auth_seed
+    try:
+        upload_path, stage_dir = prepare_notebook_upload_staging_file(p, upload_name)
+        base_item["upload_staging_name"] = upload_path.name
+    except Exception as stage_exc:
+        return {
+            **base_item,
+            "error": f"No se pudo preparar copia temporal para NotebookLM: {stage_exc}",
+            "attempts": 0,
+        }
 
     async def _upload():
         async with await _create_notebook_client_async(
@@ -3001,7 +3071,7 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
         ) as client:
             source = await client.sources.add_file(
                 notebook_id,
-                _long_path(p),
+                _long_path(upload_path),
                 wait=True,
                 wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
             )
@@ -3036,64 +3106,68 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     started = time.perf_counter()
     last_error = None
     attempts_done = 0
-    for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
-        attempts_done = attempt
-        try:
-            source, warning, rotated_cookies = asyncio.run(_upload())
-            elapsed = time.perf_counter() - started
-            return {
-                **base_item,
-                "status_code": 200,
-                "uploaded": True,
-                "error": None,
-                "warning": warning,
-                "response_body": {"ok": True, "item": _source_payload(source)},
-                "elapsed_seconds": round(elapsed, 2),
-                "attempts": attempts_done,
-                "rotated_cookies": rotated_cookies or {},
-            }
-        except (FileNotFoundError, ValidationError, AuthError) as e:
-            last_error = e
-            break
-        except httpx.HTTPStatusError as e:
-            last_error = e
-            status_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
-            if status_code != 429 and status_code < 500:
+    try:
+        for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
+            attempts_done = attempt
+            try:
+                source, warning, rotated_cookies = asyncio.run(_upload())
+                elapsed = time.perf_counter() - started
+                return {
+                    **base_item,
+                    "status_code": 200,
+                    "uploaded": True,
+                    "error": None,
+                    "warning": warning,
+                    "response_body": {"ok": True, "item": _source_payload(source)},
+                    "elapsed_seconds": round(elapsed, 2),
+                    "attempts": attempts_done,
+                    "rotated_cookies": rotated_cookies or {},
+                }
+            except (FileNotFoundError, ValidationError, AuthError) as e:
+                last_error = e
                 break
-        except (
-            SourceAddError,
-            SourceTimeoutError,
-            SourceProcessingError,
-            httpx.TimeoutException,
-            httpx.TransportError,
-        ) as e:
-            last_error = e
-        except Exception as e:
-            last_error = e
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
+                if status_code != 429 and status_code < 500:
+                    break
+            except (
+                SourceAddError,
+                SourceTimeoutError,
+                SourceProcessingError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ) as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
 
-        if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
-            refresh_note = ""
-            if isinstance(last_error, SourceAddError) or "SOURCE_ID" in str(last_error):
-                _verbose_diag_dump_source_error(upload_name, last_error, current_seed, attempt)
-                try:
-                    refreshed = asyncio.run(_refresh_tokens())
-                    if refreshed:
-                        current_seed = refreshed
-                        refresh_note = " [tokens refrescados]"
-                except ValueError as refresh_exc:
-                    raise NotebookCredentialsExpired(
-                        f"Cookies NotebookLM caducas durante refresh: {refresh_exc}"
-                    ) from refresh_exc
-                except Exception as refresh_exc:
-                    refresh_note = f" [refresh tokens fallo: {type(refresh_exc).__name__}]"
-            sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
-            sleep_s += random.uniform(0, 0.5)
-            print(
-                f"      Reintento {attempt}/{NOTEBOOK_UPLOAD_RETRY_ATTEMPTS - 1} "
-                f"de {console_safe(upload_name)} en {round(sleep_s, 2)}s "
-                f"(motivo: {type(last_error).__name__}){refresh_note}"
-            )
-            time.sleep(sleep_s)
+            if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
+                refresh_note = ""
+                if isinstance(last_error, SourceAddError) or "SOURCE_ID" in str(last_error):
+                    _verbose_diag_dump_source_error(upload_name, last_error, current_seed, attempt)
+                    try:
+                        refreshed = asyncio.run(_refresh_tokens())
+                        if refreshed:
+                            current_seed = refreshed
+                            refresh_note = " [tokens refrescados]"
+                    except ValueError as refresh_exc:
+                        raise NotebookCredentialsExpired(
+                            f"Cookies NotebookLM caducas durante refresh: {refresh_exc}"
+                        ) from refresh_exc
+                    except Exception as refresh_exc:
+                        refresh_note = f" [refresh tokens fallo: {type(refresh_exc).__name__}]"
+                sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
+                sleep_s += random.uniform(0, 0.5)
+                print(
+                    f"      Reintento {attempt}/{NOTEBOOK_UPLOAD_RETRY_ATTEMPTS - 1} "
+                    f"de {console_safe(upload_name)} en {round(sleep_s, 2)}s "
+                    f"(motivo: {type(last_error).__name__}){refresh_note}"
+                )
+                time.sleep(sleep_s)
+    finally:
+        if stage_dir is not None:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     elapsed = time.perf_counter() - started
     error_msg = _notebooklm_error_message(last_error) if last_error else "Error desconocido"

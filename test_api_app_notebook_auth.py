@@ -837,6 +837,125 @@ class DownloadDocumentoSeiaDownloadTests(unittest.TestCase):
             self.assertFalse(list(output_dir.rglob("*.rar")))
 
 
+class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
+    def test_notebook_upload_filename_is_capped(self):
+        row = {
+            "tipo": "EIA",
+            "categoria": "Minera HMC S.A Rep. Legal Jose Miguel Ibanez Anrique",
+            "texto_link": "Anexo 3.2 PAS 136",
+            "nombre_archivo": (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+            ),
+            "ruta_relativa": "Anexo_3.2_PAS_136/EIA_Minera_HMC_S.A_Rep.pdf",
+        }
+
+        notebook_name = download_documento_seia.build_notebook_upload_filename(row)
+
+        self.assertTrue(notebook_name.endswith(".pdf"))
+        self.assertLessEqual(
+            len(notebook_name),
+            download_documento_seia.NOTEBOOK_UPLOAD_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", Path(notebook_name).stem)
+
+    def test_staging_filename_is_short_and_has_no_internal_dots(self):
+        name = (
+            "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+            "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+        )
+
+        staging_name = download_documento_seia.build_notebook_upload_staging_filename(name)
+
+        self.assertTrue(staging_name.endswith(".pdf"))
+        self.assertLessEqual(
+            len(staging_name),
+            download_documento_seia.NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", Path(staging_name).stem)
+
+    def test_upload_single_document_uses_short_staging_file_before_rename(self):
+        captured = {}
+
+        class FakeSources:
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["add_file_path"] = path_str
+                self_outer.assertTrue(Path(path_str).exists())
+                return SimpleNamespace(
+                    id="source-1",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        self_outer = self
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            long_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+            )
+            source_path = Path(tmp_dir) / long_name
+            source_path.write_bytes(b"%PDF-1.4\n")
+            upload_name = download_documento_seia.build_notebook_upload_filename(
+                {
+                    "tipo": "EIA",
+                    "categoria": "Minera HMC S.A Rep. Legal Jose Miguel Ibanez Anrique",
+                    "texto_link": "Anexo 3.2 PAS 136",
+                    "nombre_archivo": long_name,
+                    "nombre_archivo_final": long_name,
+                    "ruta_relativa": long_name,
+                }
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": long_name,
+                        "nombre_archivo": long_name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        add_file_path = Path(captured["add_file_path"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(captured["rename_title"], upload_name)
+        self.assertLessEqual(
+            len(add_file_path.name),
+            download_documento_seia.NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", add_file_path.stem)
+        self.assertFalse(add_file_path.exists())
+
+
 class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
     def test_rar_extractors_prefer_7z_then_unar_then_unrar(self):
         with patch.object(download_documento_seia, "_find_7z_tool", return_value="/usr/bin/7z"), patch.object(
