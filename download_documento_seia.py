@@ -120,6 +120,24 @@ def _getenv_optional_positive_int(name: str, default: int | None) -> int | None:
     return parsed_value if parsed_value > 0 else None
 
 
+def _getenv_positive_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed_value = float(raw_value)
+    except ValueError:
+        return default
+    return parsed_value if parsed_value > 0 else default
+
+
+DOWNLOAD_RETRY_ATTEMPTS = max(
+    1,
+    _getenv_non_negative_int("SEIA_DOWNLOAD_RETRY_ATTEMPTS", 8),
+)
+DOWNLOAD_RETRY_BASE_SEC = _getenv_positive_float("SEIA_DOWNLOAD_RETRY_BASE_SEC", 4.0)
+DOWNLOAD_CONNECT_TIMEOUT_SEC = _getenv_positive_float("SEIA_DOWNLOAD_CONNECT_TIMEOUT_SEC", 15.0)
+DOWNLOAD_READ_TIMEOUT_SEC = _getenv_positive_float("SEIA_DOWNLOAD_READ_TIMEOUT_SEC", 180.0)
+DOWNLOAD_TIMEOUT = (DOWNLOAD_CONNECT_TIMEOUT_SEC, DOWNLOAD_READ_TIMEOUT_SEC)
+
 NOTEBOOK_SOURCES_PER_NOTEBOOK = _getenv_non_negative_int(
     "NOTEBOOK_SOURCES_PER_NOTEBOOK",
     300,
@@ -662,6 +680,113 @@ def _resolve_download_path(doc, output_dir):
     return filepath
 
 
+class DownloadIncompleteError(Exception):
+    """Error retryable para descargas cortadas o con tamano inesperado."""
+
+
+def _parse_non_negative_int(value):
+    """Convierte cabeceras numericas HTTP a int, si son validas."""
+    if value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _parse_content_range_total(value):
+    """Extrae el tamano total desde Content-Range: bytes start-end/total."""
+    if not value:
+        return None
+    match = re.search(r"/(\d+|\*)\s*$", str(value).strip())
+    if not match or match.group(1) == "*":
+        return None
+    return _parse_non_negative_int(match.group(1))
+
+
+def _response_expected_download_size(response, doc, bytes_already_downloaded=0):
+    """
+    Determina el tamano final esperado.
+
+    Para respuestas 206 usa Content-Range. Para 200 usa Content-Length. Si
+    no hay cabecera confiable, usa la estimacion HEAD guardada en doc.
+    """
+    content_encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
+    if content_encoding and content_encoding != "identity":
+        return None
+
+    content_range_total = _parse_content_range_total(response.headers.get("Content-Range"))
+    if content_range_total is not None:
+        return content_range_total
+
+    content_length = _parse_non_negative_int(response.headers.get("Content-Length"))
+    if content_length is not None:
+        if response.status_code == 206:
+            return bytes_already_downloaded + content_length
+        return content_length
+
+    return _parse_non_negative_int(doc.get("size_bytes"))
+
+
+def _download_temp_path(filepath):
+    """Ruta temporal no descubrible como comprimido/PDF final."""
+    return filepath.with_name(f".{filepath.name}.part")
+
+
+def _safe_unlink(filepath):
+    """Elimina un archivo si existe, tolerando paths largos."""
+    try:
+        os.remove(_long_path(filepath))
+    except FileNotFoundError:
+        return
+    except OSError:
+        try:
+            Path(filepath).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _existing_file_is_complete(filepath, expected_size=None):
+    size = _safe_stat_size(filepath)
+    if size <= 0:
+        return False
+    if expected_size is None:
+        return True
+    return size == expected_size
+
+
+def _is_retryable_download_error(error):
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code in {408, 425, 429, 500, 502, 503, 504}
+    return True
+
+
+def _download_retry_wait(attempt):
+    wait = DOWNLOAD_RETRY_BASE_SEC * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0, min(2.0, DOWNLOAD_RETRY_BASE_SEC))
+    return min(120.0, wait + jitter)
+
+
+def _format_download_error(error):
+    message = str(error) or error.__class__.__name__
+    if len(message) > 260:
+        message = message[:260] + "..."
+    return message
+
+
+def _stream_response_to_path(response, filepath, mode):
+    downloaded = 0
+    with open(_long_path(filepath), mode) as f:
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:
+                downloaded += len(chunk)
+                f.write(chunk)
+    return downloaded
+
+
 def download_file(session, doc, output_dir):
     """
     Descarga un archivo individual.
@@ -675,35 +800,113 @@ def download_file(session, doc, output_dir):
         filepath = _resolve_download_path(doc, output_dir)
         doc["download_path"] = str(filepath.relative_to(output_dir))
 
-        # Skip si ya existe (reanudable)
-        if filepath.exists() and filepath.stat().st_size > 0:
+        expected_from_head = _parse_non_negative_int(doc.get("size_bytes"))
+        if filepath.exists() and _existing_file_is_complete(filepath, expected_from_head):
             doc["status"] = "done"
-            doc["size_bytes"] = filepath.stat().st_size
+            doc["size_bytes"] = _safe_stat_size(filepath)
             return (filepath, None)
 
         os.makedirs(_long_path(filepath.parent), exist_ok=True)
 
-        response = safe_request(session, "get", url, stream=True, timeout=60)
-        response.raise_for_status()
+        tmp_path = _download_temp_path(filepath)
+        last_error = None
 
-        # Si no tiene extension, intentar deducir de Content-Type
-        if not filepath.suffix or filepath.suffix == ".bin":
-            content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-            ext = CONTENT_TYPE_EXT_MAP.get(content_type)
-            if ext and ext != ".bin":
-                filepath = filepath.with_suffix(ext)
-                doc["download_path"] = str(filepath.relative_to(output_dir))
+        for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+            response = None
+            try:
+                partial_size = _safe_stat_size(tmp_path)
+                if expected_from_head is not None and partial_size > expected_from_head:
+                    _safe_unlink(tmp_path)
+                    partial_size = 0
+                if expected_from_head is not None and partial_size == expected_from_head:
+                    os.replace(_long_path(tmp_path), _long_path(filepath))
+                    doc["size_bytes"] = expected_from_head
+                    doc["status"] = "done"
+                    return (filepath, None)
 
-        downloaded = 0
-        with open(_long_path(filepath), "wb") as f:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    downloaded += len(chunk)
-                    f.write(chunk)
+                headers = {"Accept-Encoding": "identity"}
+                if partial_size > 0:
+                    headers["Range"] = f"bytes={partial_size}-"
 
-        doc["size_bytes"] = downloaded
-        doc["status"] = "done"
-        return (filepath, None)
+                response = safe_request(
+                    session,
+                    "get",
+                    url,
+                    stream=True,
+                    timeout=DOWNLOAD_TIMEOUT,
+                    allow_redirects=True,
+                    headers=headers,
+                )
+                response.raise_for_status()
+
+                if not filepath.suffix or filepath.suffix == ".bin":
+                    content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                    ext = CONTENT_TYPE_EXT_MAP.get(content_type)
+                    if ext and ext != ".bin":
+                        filepath = filepath.with_suffix(ext)
+                        doc["download_path"] = str(filepath.relative_to(output_dir))
+                        tmp_path = _download_temp_path(filepath)
+                        os.makedirs(_long_path(filepath.parent), exist_ok=True)
+                        partial_size = _safe_stat_size(tmp_path)
+
+                append_mode = partial_size > 0 and response.status_code == 206
+                if partial_size > 0 and not append_mode:
+                    _safe_unlink(tmp_path)
+                    partial_size = 0
+
+                expected_size = _response_expected_download_size(
+                    response,
+                    doc,
+                    bytes_already_downloaded=partial_size if append_mode else 0,
+                )
+                if filepath.exists() and _existing_file_is_complete(filepath, expected_size):
+                    _safe_unlink(tmp_path)
+                    doc["size_bytes"] = _safe_stat_size(filepath)
+                    doc["status"] = "done"
+                    response.close()
+                    return (filepath, None)
+
+                bytes_written = _stream_response_to_path(
+                    response,
+                    tmp_path,
+                    "ab" if append_mode else "wb",
+                )
+                downloaded = (partial_size if append_mode else 0) + bytes_written
+
+                if expected_size is not None and downloaded != expected_size:
+                    if downloaded > expected_size:
+                        _safe_unlink(tmp_path)
+                    raise DownloadIncompleteError(
+                        f"descarga incompleta: {format_size(downloaded)} de {format_size(expected_size)}"
+                    )
+                if downloaded <= 0:
+                    raise DownloadIncompleteError("descarga vacia")
+
+                os.replace(_long_path(tmp_path), _long_path(filepath))
+                doc["size_bytes"] = downloaded
+                doc["status"] = "done"
+                response.close()
+                return (filepath, None)
+
+            except Exception as e:
+                last_error = e
+                if response is not None:
+                    response.close()
+                if not _is_retryable_download_error(e) or attempt >= DOWNLOAD_RETRY_ATTEMPTS:
+                    _safe_unlink(tmp_path)
+                    break
+                wait = _download_retry_wait(attempt)
+                print(
+                    f"\n      Descarga incompleta. Reintento {attempt + 1}/"
+                    f"{DOWNLOAD_RETRY_ATTEMPTS} en {wait:.1f}s: "
+                    f"{console_safe(_format_download_error(e))}",
+                    flush=True,
+                )
+                time.sleep(wait)
+
+        doc["status"] = "error"
+        doc["error"] = _format_download_error(last_error)
+        return (None, doc["error"])
 
     except Exception as e:
         doc["status"] = "error"

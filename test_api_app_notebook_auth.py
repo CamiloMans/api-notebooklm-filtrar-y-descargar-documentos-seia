@@ -38,6 +38,27 @@ def _headers(include_notebook_auth: bool = True) -> dict[str, str]:
     return headers
 
 
+class _FakeDownloadResponse:
+    def __init__(self, chunks, headers=None, status_code=200, error=None):
+        self._chunks = list(chunks)
+        self.headers = headers or {}
+        self.status_code = status_code
+        self.error = error
+        self.closed = False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size):
+        for chunk in self._chunks:
+            yield chunk
+        if self.error:
+            raise self.error
+
+    def close(self):
+        self.closed = True
+
+
 def _document_row(document_id: str = "doc-1") -> dict:
     return {
         "id": document_id,
@@ -726,6 +747,94 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(run_pipeline.call_args.kwargs["notebook_auth"])
+
+
+class DownloadDocumentoSeiaDownloadTests(unittest.TestCase):
+    def _download_doc(self, size_bytes=10):
+        return {
+            "index": 1,
+            "name": "Anexo prueba.rar",
+            "url": "https://example.test/anexo.rar",
+            "section": "Documentos",
+            "file_type": ".rar",
+            "size_bytes": size_bytes,
+            "download_path": None,
+            "status": "pending",
+            "error": None,
+        }
+
+    def test_download_file_resumes_after_incomplete_stream(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            first_error = download_documento_seia.requests.exceptions.ChunkedEncodingError("corte")
+            responses = [
+                _FakeDownloadResponse([b"abc"], {"Content-Length": "10"}, error=first_error),
+                _FakeDownloadResponse(
+                    [b"defghij"],
+                    {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+                    status_code=206,
+                ),
+            ]
+
+            with patch.object(download_documento_seia, "safe_request", side_effect=responses) as safe_request, patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                2,
+            ), patch.object(download_documento_seia, "DOWNLOAD_RETRY_BASE_SEC", 0):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdefghij")
+            self.assertEqual(doc["status"], "done")
+            self.assertFalse(list(output_dir.rglob("*.part")))
+            self.assertEqual(
+                safe_request.call_args_list[1].kwargs["headers"]["Range"],
+                "bytes=3-",
+            )
+
+    def test_download_file_retries_short_response_without_exception(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            responses = [
+                _FakeDownloadResponse([b"abc"], {"Content-Length": "10"}),
+                _FakeDownloadResponse(
+                    [b"defghij"],
+                    {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+                    status_code=206,
+                ),
+            ]
+
+            with patch.object(download_documento_seia, "safe_request", side_effect=responses), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                2,
+            ), patch.object(download_documento_seia, "DOWNLOAD_RETRY_BASE_SEC", 0):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdefghij")
+            self.assertEqual(doc["size_bytes"], 10)
+
+    def test_download_file_removes_temp_after_final_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            response = _FakeDownloadResponse([b"abc"], {"Content-Length": "10"})
+
+            with patch.object(download_documento_seia, "safe_request", return_value=response), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                1,
+            ):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(path)
+            self.assertIn("descarga incompleta", error)
+            self.assertEqual(doc["status"], "error")
+            self.assertFalse(list(output_dir.rglob("*.part")))
+            self.assertFalse(list(output_dir.rglob("*.rar")))
 
 
 class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
