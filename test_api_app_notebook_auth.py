@@ -955,6 +955,108 @@ class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
         self.assertNotIn(".", add_file_path.stem)
         self.assertFalse(add_file_path.exists())
 
+    def test_upload_single_document_recovers_source_id_from_created_source(self):
+        captured = {}
+
+        class FakeSources:
+            def __init__(self):
+                self.list_calls = 0
+
+            async def list(self, notebook_id):
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    return []
+                staging_name = captured["staging_name"]
+                return [
+                    SimpleNamespace(
+                        id="source-recovered",
+                        title=staging_name,
+                        kind="PDF",
+                        status=3,
+                    )
+                ]
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["staging_name"] = Path(path_str).name
+                raise download_documento_seia.SourceAddError(
+                    captured["staging_name"],
+                    message="Failed to get SOURCE_ID from registration response",
+                )
+
+            async def _start_resumable_upload(self, notebook_id, filename, file_size, source_id):
+                captured["start_upload"] = {
+                    "filename": filename,
+                    "file_size": file_size,
+                    "source_id": source_id,
+                }
+                return "https://upload.example/session"
+
+            async def _upload_file_streaming(self, upload_url, file_path):
+                captured["upload_url"] = upload_url
+                captured["uploaded_path_exists"] = Path(file_path).exists()
+
+            async def wait_until_ready(self, notebook_id, source_id, timeout):
+                captured["wait"] = {"source_id": source_id, "timeout": timeout}
+                return SimpleNamespace(
+                    id=source_id,
+                    title=captured["staging_name"],
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "archivo_original.pdf"
+            source_path.write_bytes(b"%PDF-1.4\ncontent")
+            upload_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Modificacion_de_Proyecto_Modificacion_de_Proyecto.pdf"
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertIn("SOURCE_ID", result["warning"])
+        self.assertEqual(captured["start_upload"]["source_id"], "source-recovered")
+        self.assertEqual(captured["wait"]["source_id"], "source-recovered")
+        self.assertEqual(captured["rename_title"], upload_name)
+        self.assertTrue(captured["uploaded_path_exists"])
+
 
 class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
     def test_rar_extractors_prefer_7z_then_unar_then_unrar(self):

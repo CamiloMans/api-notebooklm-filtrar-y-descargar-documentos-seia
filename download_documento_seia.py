@@ -2825,6 +2825,103 @@ def _notebooklm_error_message(exc):
     return f"Error NotebookLM: {exc}"
 
 
+def _is_source_id_registration_error(exc):
+    """Detecta el fallo donde NotebookLM crea fuente pero no retorna SOURCE_ID."""
+    if not isinstance(exc, SourceAddError):
+        return False
+    return "SOURCE_ID" in str(exc)
+
+
+def _source_attr(source, name, default=None):
+    if isinstance(source, dict):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+async def _list_source_ids(client, notebook_id):
+    try:
+        sources = await client.sources.list(notebook_id)
+    except Exception:  # noqa: BLE001
+        return set()
+    return {
+        str(_source_attr(source, "id") or "")
+        for source in sources
+        if _source_attr(source, "id")
+    }
+
+
+async def _find_registered_source_after_missing_id(
+    client,
+    notebook_id,
+    filename,
+    known_source_ids,
+):
+    """Busca fuente recien registrada cuando el RPC no devolvio SOURCE_ID."""
+    try:
+        sources = await client.sources.list(notebook_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+    exact_new_matches = []
+    exact_matches = []
+    for source in sources:
+        source_id = str(_source_attr(source, "id") or "")
+        title = str(_source_attr(source, "title") or "")
+        if title != filename or not source_id:
+            continue
+        if source_id not in known_source_ids:
+            exact_new_matches.append(source)
+        exact_matches.append(source)
+
+    if exact_new_matches:
+        return exact_new_matches[0]
+    if exact_matches:
+        return exact_matches[0]
+    return None
+
+
+async def _recover_add_file_after_missing_source_id(
+    client,
+    notebook_id,
+    upload_path,
+    filename,
+    known_source_ids,
+):
+    """Continua upload usando source_id recuperado desde lista NotebookLM."""
+    source = await _find_registered_source_after_missing_id(
+        client,
+        notebook_id,
+        filename,
+        known_source_ids,
+    )
+    if source is None:
+        return None
+
+    source_id = str(_source_attr(source, "id") or "")
+    start_upload = getattr(client.sources, "_start_resumable_upload", None)
+    stream_upload = getattr(client.sources, "_upload_file_streaming", None)
+    wait_ready = getattr(client.sources, "wait_until_ready", None)
+    if not callable(start_upload) or not callable(stream_upload) or not callable(wait_ready):
+        return None
+
+    print(
+        "      SOURCE_ID recuperado desde lista NotebookLM; "
+        f"continuando upload de {console_safe(filename)}"
+    )
+    upload_url = await start_upload(
+        notebook_id,
+        filename,
+        Path(upload_path).stat().st_size,
+        source_id,
+    )
+    await stream_upload(upload_url, Path(upload_path))
+    return await wait_ready(
+        notebook_id,
+        source_id,
+        timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
+    )
+
+
 def _normalize_notebook_auth_payload(
     notebook_auth: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -3069,13 +3166,32 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
             auth_seed=current_seed,
             timeout=NOTEBOOK_CLIENT_TIMEOUT_SEC,
         ) as client:
-            source = await client.sources.add_file(
-                notebook_id,
-                _long_path(upload_path),
-                wait=True,
-                wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
-            )
+            staging_filename = Path(upload_path).name
             warning = None
+            known_source_ids = await _list_source_ids(client, notebook_id)
+            try:
+                source = await client.sources.add_file(
+                    notebook_id,
+                    _long_path(upload_path),
+                    wait=True,
+                    wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
+                )
+            except SourceAddError as add_exc:
+                if not _is_source_id_registration_error(add_exc):
+                    raise
+                source = await _recover_add_file_after_missing_source_id(
+                    client,
+                    notebook_id,
+                    upload_path,
+                    staging_filename,
+                    known_source_ids,
+                )
+                if source is None:
+                    raise
+                warning = (
+                    "NotebookLM registro la fuente sin devolver SOURCE_ID; "
+                    "se recupero desde la lista de fuentes."
+                )
             if upload_name and source.title != upload_name:
                 try:
                     source = await client.sources.rename(
@@ -3084,10 +3200,11 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
                         upload_name,
                     )
                 except Exception as rename_exc:
-                    warning = (
+                    rename_warning = (
                         f"Source subido pero no se pudo renombrar a "
                         f"'{upload_name}': {_notebooklm_error_message(rename_exc)}"
                     )
+                    warning = f"{warning} {rename_warning}" if warning else rename_warning
             baseline_cookies = (current_seed or {}).get("cookies") or {}
             rotated_cookies = _extract_rotated_cookies(client, baseline_cookies)
         return source, warning, rotated_cookies
