@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 import api_app
+import download_documento_seia
 
 
 def _encode_auth_header(payload: dict) -> str:
@@ -725,6 +726,103 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(run_pipeline.call_args.kwargs["notebook_auth"])
+
+
+class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
+    def test_rar_extractors_prefer_7z_then_unar_then_unrar(self):
+        with patch.object(download_documento_seia, "_find_7z_tool", return_value="/usr/bin/7z"), patch.object(
+            download_documento_seia,
+            "_find_unar_tool",
+            return_value="/usr/bin/unar",
+        ), patch.object(
+            download_documento_seia,
+            "_find_unrar_tool",
+            return_value="/usr/bin/unrar",
+        ):
+            extractors = download_documento_seia._find_rar_extractors()
+
+        self.assertEqual(
+            extractors,
+            [
+                ("7z", "/usr/bin/7z"),
+                ("unar", "/usr/bin/unar"),
+                ("unrar", "/usr/bin/unrar"),
+            ],
+        )
+
+    def test_rar_extraction_rejects_partial_nonzero_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_path = tmp_path / "archivo.rar"
+            extract_dir = tmp_path / "archivo"
+            archive_path.write_bytes(b"rar")
+
+            def fake_run(cmd, **_kwargs):
+                output_arg = next(arg for arg in cmd if str(arg).startswith("-o") and arg != "-o+")
+                output_dir = Path(str(output_arg)[2:])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "parcial.pdf").write_bytes(b"parcial")
+                return SimpleNamespace(returncode=2, stderr="CRC error", stdout="")
+
+            with patch.object(
+                download_documento_seia,
+                "_find_rar_extractors",
+                return_value=[("7z", "7z")],
+            ), patch.object(
+                download_documento_seia.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(
+                download_documento_seia.sys,
+                "platform",
+                "linux",
+            ):
+                count, error = download_documento_seia._extract_rar_with_unrar(
+                    archive_path,
+                    extract_dir,
+                )
+
+        self.assertEqual(count, 0)
+        self.assertIn("7z error (code 2)", error)
+        self.assertIn("extraccion parcial descartada", error)
+        self.assertFalse(extract_dir.exists())
+
+    def test_rar_extraction_falls_back_after_failed_7z(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_path = tmp_path / "archivo.rar"
+            extract_dir = tmp_path / "archivo"
+            archive_path.write_bytes(b"rar")
+
+            def fake_run(cmd, **_kwargs):
+                if cmd[0] == "7z":
+                    return SimpleNamespace(returncode=2, stderr="unsupported rar", stdout="")
+                output_dir = Path(cmd[cmd.index("-output-directory") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "final.pdf").write_bytes(b"final")
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            with patch.object(
+                download_documento_seia,
+                "_find_rar_extractors",
+                return_value=[("7z", "7z"), ("unar", "unar")],
+            ), patch.object(
+                download_documento_seia.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(
+                download_documento_seia.sys,
+                "platform",
+                "linux",
+            ):
+                count, error = download_documento_seia._extract_rar_with_unrar(
+                    archive_path,
+                    extract_dir,
+                )
+
+            self.assertIsNone(error)
+            self.assertEqual(count, 1)
+            self.assertTrue(any(path.name == "final.pdf" for path in extract_dir.rglob("*.pdf")))
 
 
 if __name__ == "__main__":

@@ -1234,6 +1234,70 @@ def _find_unrar_tool():
     return None
 
 
+def _find_7z_tool():
+    """Busca un ejecutable 7-Zip compatible con extraccion por CLI."""
+    for tool_name in ("7z", "7zz", "7za"):
+        tool = shutil.which(tool_name)
+        if tool:
+            return tool
+    for p in [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _find_unar_tool():
+    """Busca The Unarchiver (`unar`) como respaldo para RAR modernos."""
+    return shutil.which("unar")
+
+
+def _find_rar_extractors():
+    """Retorna extractores RAR disponibles en orden de preferencia."""
+    extractors = []
+    seven_zip_tool = _find_7z_tool()
+    if seven_zip_tool:
+        extractors.append(("7z", seven_zip_tool))
+    unar_tool = _find_unar_tool()
+    if unar_tool:
+        extractors.append(("unar", unar_tool))
+    unrar_tool = _find_unrar_tool()
+    if unrar_tool:
+        extractors.append(("unrar", unrar_tool))
+    return extractors
+
+
+def _rar_extract_command(kind, tool, start_archive, extract_dir):
+    """Construye comando de extraccion RAR para el extractor elegido."""
+    if kind == "7z":
+        return [tool, "x", "-y", f"-o{extract_dir}", str(start_archive)]
+    if kind == "unar":
+        return [
+            tool,
+            "-quiet",
+            "-force-overwrite",
+            "-output-directory",
+            str(extract_dir),
+            str(start_archive),
+        ]
+    return [tool, "x", "-o+", "-y", str(start_archive), str(extract_dir) + os.sep]
+
+
+def _format_rar_process_error(kind, result, partial_files):
+    """Resume un fallo del extractor sin aceptar salidas parciales."""
+    err = (result.stderr or "").strip() or (result.stdout or "").strip()
+    if len(err) > 300:
+        err = err[:300] + "..."
+    if not err:
+        err = "sin detalle"
+    partial_note = ""
+    if partial_files:
+        partial_note = f"; extraccion parcial descartada ({partial_files} archivo(s))"
+    return f"{kind} error (code {result.returncode}): {err}{partial_note}"
+
+
 def _robocopy_move(src, dst):
     """Mueve directorio usando robocopy (soporta paths largos en Windows)."""
     dst_str = str(Path(dst).resolve())
@@ -1264,12 +1328,14 @@ def _extract_rar_group_with_unrar(volume_items, start_source_name, extract_dir):
     """
     import tempfile
 
-    unrar_tool = _find_unrar_tool()
-    if not unrar_tool:
-        return (0, "UnRAR no encontrado. Instala WinRAR o agrega unrar al PATH.")
+    extractors = _find_rar_extractors()
+    if not extractors:
+        return (
+            0,
+            "Extractor RAR no encontrado. Instala 7-Zip, unar o UnRAR y agrega el ejecutable al PATH.",
+        )
 
     stage_dir = Path(tempfile.mkdtemp(prefix="seia_vol_"))
-    tmp_extract_dir = Path(tempfile.mkdtemp(prefix="seia_ext_"))
 
     try:
         for item in volume_items:
@@ -1281,42 +1347,47 @@ def _extract_rar_group_with_unrar(volume_items, start_source_name, extract_dir):
         if not start_archive.exists():
             return (0, f"Volumen inicial no encontrado: {start_source_name}")
 
-        result = subprocess.run(
-            [unrar_tool, "x", "-o+", "-y", str(start_archive), str(tmp_extract_dir) + os.sep],
-            capture_output=True, text=True, timeout=900
-        )
+        errors = []
+        for kind, tool in extractors:
+            tmp_extract_dir = Path(tempfile.mkdtemp(prefix="seia_ext_"))
+            try:
+                result = subprocess.run(
+                    _rar_extract_command(kind, tool, start_archive, tmp_extract_dir),
+                    capture_output=True, text=True, timeout=900
+                )
 
-        num_files = _count_files_in_dir(tmp_extract_dir)
-        if result.returncode != 0 and num_files == 0:
-            err = result.stderr.strip() or result.stdout.strip()
-            if len(err) > 300:
-                err = err[:300] + "..."
-            return (0, f"UnRAR error (code {result.returncode}): {err}")
+                num_files = _count_files_in_dir(tmp_extract_dir)
+                if result.returncode != 0:
+                    errors.append(_format_rar_process_error(kind, result, num_files))
+                    continue
 
-        if Path(extract_dir).exists():
-            shutil.rmtree(str(extract_dir), ignore_errors=True)
-        os.makedirs(str(extract_dir), exist_ok=True)
+                if Path(extract_dir).exists():
+                    shutil.rmtree(str(extract_dir), ignore_errors=True)
+                os.makedirs(str(extract_dir), exist_ok=True)
 
-        if sys.platform == "win32":
-            _robocopy_move(tmp_extract_dir, extract_dir)
-        else:
-            shutil.move(str(tmp_extract_dir), str(extract_dir))
+                if sys.platform == "win32":
+                    _robocopy_move(tmp_extract_dir, extract_dir)
+                else:
+                    shutil.move(str(tmp_extract_dir), str(extract_dir))
 
-        num_files = _count_files_in_dir(extract_dir)
-        return (num_files, None)
+                num_files = _count_files_in_dir(extract_dir)
+                return (num_files, None)
+            finally:
+                if tmp_extract_dir.exists():
+                    shutil.rmtree(tmp_extract_dir, ignore_errors=True)
+
+        return (0, " | ".join(errors) if errors else "No se pudo extraer el RAR.")
 
     except Exception as e:
         return (0, str(e))
     finally:
         if stage_dir.exists():
             shutil.rmtree(stage_dir, ignore_errors=True)
-        if tmp_extract_dir.exists():
-            shutil.rmtree(tmp_extract_dir, ignore_errors=True)
 
 
 def _extract_rar_with_unrar(archive_path, extract_dir):
     """
-    Extrae RAR usando UnRAR.exe via directorio temporal corto.
+    Extrae RAR usando 7-Zip/unar/UnRAR via directorio temporal corto.
     Evita el limite de 260 caracteres de Windows extrayendo a un path corto
     y usando robocopy para mover al destino final.
     """
