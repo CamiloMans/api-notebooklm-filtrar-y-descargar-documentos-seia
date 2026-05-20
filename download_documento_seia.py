@@ -2838,6 +2838,40 @@ def _source_attr(source, name, default=None):
     return getattr(source, name, default)
 
 
+def _source_status_int(source):
+    try:
+        return int(_source_attr(source, "status", 0) or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _prefer_reusable_source(matches, known_source_ids):
+    """Elige una fuente reutilizable evitando duplicados viejos en error."""
+    if not matches:
+        return None
+
+    ready_matches = [source for source in matches if _source_status_int(source) == 2]
+    if ready_matches:
+        return ready_matches[0]
+
+    new_matches = [
+        source
+        for source in matches
+        if str(_source_attr(source, "id") or "") not in known_source_ids
+    ]
+    new_non_error = [source for source in new_matches if _source_status_int(source) != 3]
+    if new_non_error:
+        return new_non_error[0]
+    if new_matches:
+        return new_matches[0]
+
+    non_error_matches = [source for source in matches if _source_status_int(source) != 3]
+    if non_error_matches:
+        return non_error_matches[0]
+
+    return matches[-1]
+
+
 async def _list_source_ids(client, notebook_id):
     try:
         sources = await client.sources.list(notebook_id)
@@ -2862,22 +2896,15 @@ async def _find_registered_source_after_missing_id(
     except Exception:  # noqa: BLE001
         return None
 
-    exact_new_matches = []
     exact_matches = []
     for source in sources:
         source_id = str(_source_attr(source, "id") or "")
         title = str(_source_attr(source, "title") or "")
         if title != filename or not source_id:
             continue
-        if source_id not in known_source_ids:
-            exact_new_matches.append(source)
         exact_matches.append(source)
 
-    if exact_new_matches:
-        return exact_new_matches[0]
-    if exact_matches:
-        return exact_matches[0]
-    return None
+    return _prefer_reusable_source(exact_matches, known_source_ids)
 
 
 async def _recover_add_file_after_missing_source_id(
@@ -2898,6 +2925,13 @@ async def _recover_add_file_after_missing_source_id(
         return None
 
     source_id = str(_source_attr(source, "id") or "")
+    if _source_status_int(source) == 2:
+        print(
+            "      SOURCE_ID recuperado desde fuente lista en NotebookLM; "
+            f"reusando {console_safe(filename)}"
+        )
+        return source
+
     start_upload = getattr(client.sources, "_start_resumable_upload", None)
     stream_upload = getattr(client.sources, "_upload_file_streaming", None)
     wait_ready = getattr(client.sources, "wait_until_ready", None)
