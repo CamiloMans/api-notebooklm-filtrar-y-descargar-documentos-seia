@@ -836,6 +836,72 @@ class DownloadDocumentoSeiaDownloadTests(unittest.TestCase):
             self.assertFalse(list(output_dir.rglob("*.part")))
             self.assertFalse(list(output_dir.rglob("*.rar")))
 
+    def test_download_file_can_keep_temp_after_final_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            response = _FakeDownloadResponse([b"abc"], {"Content-Length": "10"})
+
+            with patch.object(download_documento_seia, "safe_request", return_value=response), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                1,
+            ):
+                path, error = download_documento_seia.download_file(
+                    object(),
+                    doc,
+                    output_dir,
+                    keep_partial_on_failure=True,
+                )
+
+            self.assertIsNone(path)
+            self.assertIn("descarga incompleta", error)
+            self.assertEqual(doc["status"], "error")
+            self.assertTrue(list(output_dir.rglob("*.part")))
+            self.assertFalse(list(output_dir.rglob("*.rar")))
+
+    def test_download_all_retries_failed_documents_until_complete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            attempts = []
+
+            def fake_download_file(_session, current_doc, _output_dir, keep_partial_on_failure=False):
+                attempts.append(keep_partial_on_failure)
+                if len(attempts) == 1:
+                    current_doc["status"] = "error"
+                    current_doc["error"] = "corte"
+                    return None, "corte"
+                current_doc["status"] = "done"
+                current_doc["error"] = None
+                current_doc["size_bytes"] = 10
+                return output_dir / "Anexo_prueba.rar", None
+
+            with patch.object(
+                download_documento_seia,
+                "download_file",
+                side_effect=fake_download_file,
+            ), patch.object(download_documento_seia, "time") as fake_time, patch.object(
+                download_documento_seia,
+                "REQUIRE_COMPLETE_DOWNLOADS",
+                True,
+            ), patch.object(download_documento_seia, "DOWNLOAD_FAILED_PASS_BASE_SEC", 0.01), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_FAILED_PASS_MAX_SEC",
+                0.01,
+            ):
+                fake_time.time.side_effect = [0, 1, 2, 3, 4, 5]
+                done, failed, total_bytes, _elapsed = download_documento_seia.download_all(
+                    object(),
+                    [doc],
+                    output_dir,
+                )
+
+            self.assertEqual(done, 1)
+            self.assertEqual(failed, 0)
+            self.assertEqual(total_bytes, 10)
+            self.assertEqual(attempts, [True, True])
+
 
 class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
     def test_notebook_upload_filename_is_capped(self):

@@ -129,6 +129,13 @@ def _getenv_positive_float(name: str, default: float) -> float:
     return parsed_value if parsed_value > 0 else default
 
 
+def _getenv_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "y", "on", "si", "sí"}
+
+
 DOWNLOAD_RETRY_ATTEMPTS = max(
     1,
     _getenv_non_negative_int("SEIA_DOWNLOAD_RETRY_ATTEMPTS", 8),
@@ -137,6 +144,10 @@ DOWNLOAD_RETRY_BASE_SEC = _getenv_positive_float("SEIA_DOWNLOAD_RETRY_BASE_SEC",
 DOWNLOAD_CONNECT_TIMEOUT_SEC = _getenv_positive_float("SEIA_DOWNLOAD_CONNECT_TIMEOUT_SEC", 15.0)
 DOWNLOAD_READ_TIMEOUT_SEC = _getenv_positive_float("SEIA_DOWNLOAD_READ_TIMEOUT_SEC", 180.0)
 DOWNLOAD_TIMEOUT = (DOWNLOAD_CONNECT_TIMEOUT_SEC, DOWNLOAD_READ_TIMEOUT_SEC)
+REQUIRE_COMPLETE_DOWNLOADS = _getenv_bool("SEIA_REQUIRE_COMPLETE_DOWNLOADS", True)
+DOWNLOAD_FAILED_PASS_LIMIT = _getenv_non_negative_int("SEIA_DOWNLOAD_FAILED_PASS_LIMIT", 0)
+DOWNLOAD_FAILED_PASS_BASE_SEC = _getenv_positive_float("SEIA_DOWNLOAD_FAILED_PASS_BASE_SEC", 30.0)
+DOWNLOAD_FAILED_PASS_MAX_SEC = _getenv_positive_float("SEIA_DOWNLOAD_FAILED_PASS_MAX_SEC", 300.0)
 
 NOTEBOOK_SOURCES_PER_NOTEBOOK = _getenv_non_negative_int(
     "NOTEBOOK_SOURCES_PER_NOTEBOOK",
@@ -809,7 +820,7 @@ def _stream_response_to_path(response, filepath, mode):
     return downloaded
 
 
-def download_file(session, doc, output_dir):
+def download_file(session, doc, output_dir, keep_partial_on_failure=False):
     """
     Descarga un archivo individual.
     Retorna (path_descargado, error_o_None).
@@ -915,7 +926,8 @@ def download_file(session, doc, output_dir):
                 if response is not None:
                     response.close()
                 if not _is_retryable_download_error(e) or attempt >= DOWNLOAD_RETRY_ATTEMPTS:
-                    _safe_unlink(tmp_path)
+                    if not keep_partial_on_failure:
+                        _safe_unlink(tmp_path)
                     break
                 wait = _download_retry_wait(attempt)
                 print(
@@ -936,12 +948,32 @@ def download_file(session, doc, output_dir):
         return (None, str(e))
 
 
+def _documents_not_done(documents):
+    return [doc for doc in documents if doc.get("status") != "done"]
+
+
+def _cleanup_partial_downloads(documents, output_dir):
+    for doc in documents:
+        rel_path = doc.get("download_path")
+        if not rel_path:
+            continue
+        try:
+            filepath = (Path(output_dir) / str(rel_path)).resolve()
+        except Exception:
+            continue
+        _safe_unlink(_download_temp_path(filepath))
+
+
+def _download_failed_pass_wait(pass_number):
+    wait = DOWNLOAD_FAILED_PASS_BASE_SEC * (2 ** max(0, pass_number - 1))
+    wait = min(DOWNLOAD_FAILED_PASS_MAX_SEC, wait)
+    jitter = random.uniform(0, min(5.0, DOWNLOAD_FAILED_PASS_BASE_SEC))
+    return wait + jitter
+
+
 def download_all(session, documents, output_dir, progress_callback=None):
     """Descarga todos los documentos con progreso detallado."""
     total = len(documents)
-    done = 0
-    failed = 0
-    total_bytes = 0
     start_time = time.time()
     emit_progress(
         progress_callback,
@@ -951,45 +983,116 @@ def download_all(session, documents, output_dir, progress_callback=None):
         message="Iniciando descarga de documentos SEIA.",
     )
 
-    for i, doc in enumerate(documents):
-        filename = doc["name"]
-        size_str = format_size(doc["size_bytes"]) if doc["size_bytes"] else "?"
-        if len(filename) > 55:
-            filename = filename[:52] + "..."
+    pass_number = 0
+    while True:
+        pending_docs = _documents_not_done(documents)
+        if not pending_docs:
+            break
 
-        print(f"  [{i+1}/{total}] {console_safe(filename)} ({size_str}) ... ", end="", flush=True)
+        if pass_number > 0:
+            if DOWNLOAD_FAILED_PASS_LIMIT and pass_number > DOWNLOAD_FAILED_PASS_LIMIT:
+                print(
+                    f"  Descarga completa no lograda tras {DOWNLOAD_FAILED_PASS_LIMIT} "
+                    f"pasada(s) extra.",
+                    flush=True,
+                )
+                break
+            wait = _download_failed_pass_wait(pass_number)
+            failed_names = ", ".join(
+                console_safe(str(doc.get("name") or "sin nombre")) for doc in pending_docs[:4]
+            )
+            if len(pending_docs) > 4:
+                failed_names += f", +{len(pending_docs) - 4} mas"
+            print(
+                f"\n  Reintentando {len(pending_docs)} descarga(s) fallida(s) "
+                f"hasta completar. Pasada extra {pass_number}"
+                f"{('/' + str(DOWNLOAD_FAILED_PASS_LIMIT)) if DOWNLOAD_FAILED_PASS_LIMIT else ''} "
+                f"en {wait:.1f}s: {failed_names}",
+                flush=True,
+            )
+            emit_progress(
+                progress_callback,
+                stage="downloading",
+                current=sum(1 for doc in documents if doc.get("status") == "done"),
+                total=total,
+                message=(
+                    f"Reintentando {len(pending_docs)} descarga(s) fallida(s) "
+                    "hasta completar archivos SEIA."
+                ),
+                done=sum(1 for doc in documents if doc.get("status") == "done"),
+                failed=len(pending_docs),
+            )
+            time.sleep(wait)
 
-        file_start = time.time()
-        path, error = download_file(session, doc, output_dir)
-        file_elapsed = time.time() - file_start
+        docs_this_pass = pending_docs
+        attempted_in_pass = 0
+        for doc in docs_this_pass:
+            attempted_in_pass += 1
+            global_done_before = sum(1 for item in documents if item.get("status") == "done")
+            filename = doc["name"]
+            size_str = format_size(doc["size_bytes"]) if doc["size_bytes"] else "?"
+            if len(filename) > 55:
+                filename = filename[:52] + "..."
 
-        if error:
-            failed += 1
-            print(f"ERROR ({console_safe(error)})")
-        else:
-            done += 1
-            actual_size = doc.get("size_bytes", 0) or 0
-            total_bytes += actual_size
-            print(f"OK [{format_duration(file_elapsed)}]")
+            print(
+                f"  [{global_done_before + attempted_in_pass}/{total}] "
+                f"{console_safe(filename)} ({size_str}) ... ",
+                end="",
+                flush=True,
+            )
 
-        emit_progress(
-            progress_callback,
-            stage="downloading",
-            current=i + 1,
-            total=total,
-            message=f"Descarga {i + 1}/{total}: {filename}",
-            done=done,
-            failed=failed,
-        )
+            doc["status"] = "pending"
+            doc["error"] = None
+            file_start = time.time()
+            _path, error = download_file(
+                session,
+                doc,
+                output_dir,
+                keep_partial_on_failure=REQUIRE_COMPLETE_DOWNLOADS,
+            )
+            file_elapsed = time.time() - file_start
 
-        # Progreso parcial cada 10 archivos
-        if (i + 1) % 10 == 0 and i + 1 < total:
-            elapsed = time.time() - start_time
-            print(f"  --- Progreso: {done}/{i+1} OK, {failed} errores | "
-                  f"{format_size(total_bytes)} descargados | "
-                  f"Tiempo: {format_duration(elapsed)}")
+            done = sum(1 for item in documents if item.get("status") == "done")
+            failed = len(_documents_not_done(documents))
+            total_bytes = sum(
+                item.get("size_bytes") or 0 for item in documents if item.get("status") == "done"
+            )
+
+            if error:
+                print(f"ERROR ({console_safe(error)})")
+            else:
+                print(f"OK [{format_duration(file_elapsed)}]")
+
+            emit_progress(
+                progress_callback,
+                stage="downloading",
+                current=done,
+                total=total,
+                message=(
+                    f"Descargados {done}/{total}: {filename}"
+                    if not error
+                    else f"Fallo temporal {done}/{total}: {filename}"
+                ),
+                done=done,
+                failed=failed,
+            )
+
+            if done and done % 10 == 0 and done < total and not error:
+                elapsed = time.time() - start_time
+                print(f"  --- Progreso: {done}/{done + failed} OK, {failed} errores | "
+                      f"{format_size(total_bytes)} descargados | "
+                      f"Tiempo: {format_duration(elapsed)}")
+
+        pass_number += 1
+        if not REQUIRE_COMPLETE_DOWNLOADS:
+            break
 
     elapsed = time.time() - start_time
+    done = sum(1 for doc in documents if doc.get("status") == "done")
+    failed = len(_documents_not_done(documents))
+    total_bytes = sum(doc.get("size_bytes") or 0 for doc in documents if doc.get("status") == "done")
+    if failed and not REQUIRE_COMPLETE_DOWNLOADS:
+        _cleanup_partial_downloads(_documents_not_done(documents), output_dir)
     return done, failed, total_bytes, elapsed
 
 
@@ -3714,6 +3817,19 @@ def run_seia_notebook_pipeline(
         done, failed, total_bytes, dl_elapsed = download_all(
             session, documents, output_dir, progress_callback=progress_callback
         )
+        if failed and REQUIRE_COMPLETE_DOWNLOADS:
+            failed_docs = [
+                str(doc.get("name") or doc.get("url") or "documento sin nombre")
+                for doc in _documents_not_done(documents)
+            ]
+            preview = "; ".join(failed_docs[:5])
+            if len(failed_docs) > 5:
+                preview += f"; +{len(failed_docs) - 5} mas"
+            raise RuntimeError(
+                "Descarga SEIA incompleta: "
+                f"{failed} archivo(s) raiz no se pudieron descargar completos. "
+                f"Fallidos: {preview}"
+            )
 
         # ==== CHECKPOINT 4: Extraccion de archivos comprimidos ====
         if not no_extract:
