@@ -2,7 +2,13 @@ FROM python:3.11-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
+    ghostscript \
+    ocrmypdf \
     p7zip-full \
+    qpdf \
+    tesseract-ocr \
+    tesseract-ocr-eng \
+    tesseract-ocr-spa \
     unar \
     unrar-free \
     && rm -rf /var/lib/apt/lists/*

@@ -187,6 +187,14 @@ NOTEBOOK_COOKIE_PERSIST_EVERY_N = max(
     1,
     int(os.getenv("NOTEBOOK_COOKIE_PERSIST_EVERY_N", "5") or "5"),
 )
+NOTEBOOK_PDF_SANITIZE_ENABLED = _getenv_bool("NOTEBOOK_PDF_SANITIZE_ENABLED", True)
+NOTEBOOK_PDF_REWRITE_ENABLED = _getenv_bool("NOTEBOOK_PDF_REWRITE_ENABLED", True)
+NOTEBOOK_PDF_OCR_ENABLED = _getenv_bool("NOTEBOOK_PDF_OCR_ENABLED", True)
+NOTEBOOK_PDF_SANITIZE_TIMEOUT_SEC = max(
+    60,
+    _getenv_non_negative_int("NOTEBOOK_PDF_SANITIZE_TIMEOUT_SEC", 1800),
+)
+NOTEBOOK_PDF_OCR_LANG = (os.getenv("NOTEBOOK_PDF_OCR_LANG", "spa+eng") or "spa+eng").strip()
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -2463,6 +2471,107 @@ def prepare_notebook_upload_staging_file(source_path, upload_name):
     return stage_path, stage_dir
 
 
+def _run_pdf_tool(cmd, timeout=NOTEBOOK_PDF_SANITIZE_TIMEOUT_SEC):
+    """Ejecuta herramienta PDF externa y devuelve salida para diagnostico."""
+    result = subprocess.run(
+        [str(part) for part in cmd],
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise RuntimeError(stderr[:1000] or f"Comando fallo con codigo {result.returncode}")
+    return result
+
+
+def _rewrite_pdf_for_notebook(source_path, output_path):
+    """Reescribe estructura PDF preservando contenido para mejorar compatibilidad."""
+    source_path = Path(source_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    qpdf = shutil.which("qpdf")
+    if qpdf:
+        _run_pdf_tool([
+            qpdf,
+            "--linearize",
+            "--object-streams=disable",
+            _long_path(source_path),
+            _long_path(output_path),
+        ])
+    else:
+        gs = shutil.which("gs") or shutil.which("gswin64c") or shutil.which("gswin32c")
+        if not gs:
+            raise RuntimeError("No esta disponible qpdf ni ghostscript para reescribir PDF.")
+        _run_pdf_tool([
+            gs,
+            "-dSAFER",
+            "-dBATCH",
+            "-dNOPAUSE",
+            "-dQUIET",
+            "-sDEVICE=pdfwrite",
+            "-dCompatibilityLevel=1.7",
+            "-dPDFSETTINGS=/prepress",
+            f"-sOutputFile={_long_path(output_path)}",
+            _long_path(source_path),
+        ])
+
+    if not _path_exists(output_path) or output_path.stat().st_size <= 0:
+        raise RuntimeError("Reescritura PDF no genero archivo valido.")
+    return output_path
+
+
+def _flatten_ocr_pdf_for_notebook(source_path, output_path):
+    """Aplana PDF y agrega capa OCR con OCRmyPDF/Tesseract."""
+    source_path = Path(source_path)
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    ocrmypdf = shutil.which("ocrmypdf")
+    if not ocrmypdf:
+        raise RuntimeError("No esta disponible ocrmypdf para aplanar + OCR.")
+
+    lang = NOTEBOOK_PDF_OCR_LANG or "spa+eng"
+    _run_pdf_tool([
+        ocrmypdf,
+        "--force-ocr",
+        "--rotate-pages",
+        "--deskew",
+        "--optimize",
+        "1",
+        "--jobs",
+        "1",
+        "--language",
+        lang,
+        _long_path(source_path),
+        _long_path(output_path),
+    ])
+    if not _path_exists(output_path) or output_path.stat().st_size <= 0:
+        raise RuntimeError("OCR PDF no genero archivo valido.")
+    return output_path
+
+
+def _is_pdf_sanitize_candidate(path, last_error):
+    if not NOTEBOOK_PDF_SANITIZE_ENABLED:
+        return False
+    if Path(path).suffix.lower() != ".pdf":
+        return False
+    if isinstance(last_error, (AuthError, ValidationError, FileNotFoundError)):
+        return False
+    if isinstance(last_error, (SourceProcessingError, SourceTimeoutError)):
+        return True
+    if _is_source_id_registration_error(last_error):
+        return True
+    if isinstance(last_error, httpx.HTTPStatusError):
+        status_code = getattr(getattr(last_error, "response", None), "status_code", 0) or 0
+        return status_code >= 500
+    if isinstance(last_error, RPCError):
+        message = str(last_error).lower()
+        return any(token in message for token in ("source", "rlm1ne", "status code 16", "500"))
+    return False
+
+
 def rename_final_pdf_documents(output_dir, docs):
     """
     Renombra fisicamente los PDF finales usando contexto semantico.
@@ -3263,13 +3372,15 @@ def select_first_documents_for_upload(docs_report, limit=None):
 
 
 def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_seed=None):
-    """Sube un solo documento al notebook via notebooklm-py directamente."""
+    """Sube un documento; para PDFs dificiles prueba reescritura y OCR."""
+    import tempfile
+
     p = Path(doc["ruta_absoluta"])
     upload_name = str(
         doc.get("nombre_archivo_notebook") or build_notebook_upload_filename(doc)
     )
-    upload_path = p
-    stage_dir = None
+    upload_path = None
+    stage_dirs = []
     base_item = {
         "_order": order,
         "document_id": doc.get("document_id"),
@@ -3287,9 +3398,16 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
         return {**base_item, "error": f"No existe archivo: {p}", "attempts": 0}
 
     current_seed = auth_seed
-    try:
-        upload_path, stage_dir = prepare_notebook_upload_staging_file(p, upload_name)
+
+    def _prepare_upload_path(source_file):
+        nonlocal upload_path
+        prepared_path, prepared_dir = prepare_notebook_upload_staging_file(source_file, upload_name)
+        stage_dirs.append(prepared_dir)
+        upload_path = prepared_path
         base_item["upload_staging_name"] = upload_path.name
+
+    try:
+        _prepare_upload_path(p)
     except Exception as stage_exc:
         return {
             **base_item,
@@ -3357,26 +3475,38 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
             "session_id": new_sess,
         }
 
-    started = time.perf_counter()
-    last_error = None
-    attempts_done = 0
-    try:
+    def _run_upload_attempts(variant_label):
+        nonlocal current_seed
+        started = time.perf_counter()
+        last_error = None
+        attempts_done = 0
         for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
             attempts_done = attempt
             try:
                 source, warning, rotated_cookies = asyncio.run(_upload())
                 elapsed = time.perf_counter() - started
+                variant_warning = None
+                if variant_label != "original":
+                    variant_warning = (
+                        f"Subido usando PDF {variant_label} tras fallo del PDF original."
+                    )
+                final_warning = warning
+                if variant_warning:
+                    final_warning = (
+                        f"{variant_warning} {warning}" if warning else variant_warning
+                    )
                 return {
                     **base_item,
                     "status_code": 200,
                     "uploaded": True,
                     "error": None,
-                    "warning": warning,
+                    "warning": final_warning,
                     "response_body": {"ok": True, "item": _source_payload(source)},
                     "elapsed_seconds": round(elapsed, 2),
                     "attempts": attempts_done,
+                    "upload_variant": variant_label,
                     "rotated_cookies": rotated_cookies or {},
-                }
+                }, None, attempts_done
             except (FileNotFoundError, ValidationError, AuthError) as e:
                 last_error = e
                 break
@@ -3419,19 +3549,76 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
                     f"(motivo: {type(last_error).__name__}){refresh_note}"
                 )
                 time.sleep(sleep_s)
-    finally:
-        if stage_dir is not None:
-            shutil.rmtree(stage_dir, ignore_errors=True)
+        return None, last_error, attempts_done
 
-    elapsed = time.perf_counter() - started
-    error_msg = _notebooklm_error_message(last_error) if last_error else "Error desconocido"
-    if attempts_done > 1:
-        error_msg = f"{error_msg} [tras {attempts_done} intentos]"
+    total_attempts = 0
+    final_error = None
+    fallback_notes = []
+    total_started = time.perf_counter()
+    try:
+        result, final_error, attempts_done = _run_upload_attempts("original")
+        total_attempts += attempts_done
+        if result:
+            return result
+
+        if _is_pdf_sanitize_candidate(p, final_error):
+            sanitize_dir = Path(tempfile.mkdtemp(prefix="notebook_pdf_sanitize_"))
+            stage_dirs.append(sanitize_dir)
+
+            if NOTEBOOK_PDF_REWRITE_ENABLED:
+                try:
+                    rewritten_path = sanitize_dir / "rewritten.pdf"
+                    print(
+                        "      PDF original fallo; probando PDF reescrito para "
+                        f"{console_safe(upload_name)}"
+                    )
+                    _rewrite_pdf_for_notebook(p, rewritten_path)
+                    _prepare_upload_path(rewritten_path)
+                    result, final_error, attempts_done = _run_upload_attempts("reescrito")
+                    total_attempts += attempts_done
+                    if result:
+                        result["upload_total_attempts"] = total_attempts
+                        return result
+                    fallback_notes.append(
+                        f"reescrito fallo: {_notebooklm_error_message(final_error)}"
+                    )
+                except Exception as sanitize_exc:  # noqa: BLE001
+                    fallback_notes.append(f"reescritura fallo: {sanitize_exc}")
+
+            if NOTEBOOK_PDF_OCR_ENABLED:
+                try:
+                    ocr_path = sanitize_dir / "flattened_ocr.pdf"
+                    print(
+                        "      PDF reescrito fallo; probando PDF aplanado + OCR para "
+                        f"{console_safe(upload_name)}"
+                    )
+                    _flatten_ocr_pdf_for_notebook(p, ocr_path)
+                    _prepare_upload_path(ocr_path)
+                    result, final_error, attempts_done = _run_upload_attempts("aplanado+OCR")
+                    total_attempts += attempts_done
+                    if result:
+                        result["upload_total_attempts"] = total_attempts
+                        return result
+                    fallback_notes.append(
+                        f"aplanado+OCR fallo: {_notebooklm_error_message(final_error)}"
+                    )
+                except Exception as sanitize_exc:  # noqa: BLE001
+                    fallback_notes.append(f"aplanado+OCR fallo: {sanitize_exc}")
+    finally:
+        for cleanup_dir in stage_dirs:
+            shutil.rmtree(cleanup_dir, ignore_errors=True)
+
+    elapsed = time.perf_counter() - total_started
+    error_msg = _notebooklm_error_message(final_error) if final_error else "Error desconocido"
+    if total_attempts > 1:
+        error_msg = f"{error_msg} [tras {total_attempts} intentos totales]"
+    if fallback_notes:
+        error_msg = f"{error_msg} | fallback PDF: {'; '.join(fallback_notes)}"
     return {
         **base_item,
         "error": error_msg,
         "elapsed_seconds": round(elapsed, 2),
-        "attempts": attempts_done,
+        "attempts": total_attempts,
     }
 
 

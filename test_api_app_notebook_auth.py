@@ -1222,6 +1222,180 @@ class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
         self.assertFalse(captured.get("start_upload_called", False))
         self.assertFalse(captured.get("stream_called", False))
 
+    def test_upload_single_document_rewrites_pdf_after_source_id_failure(self):
+        captured = {"payloads": []}
+
+        class FakeSources:
+            async def list(self, notebook_id):
+                return []
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                payload = Path(path_str).read_bytes()
+                captured["payloads"].append(payload)
+                if payload != b"rewritten-pdf":
+                    raise download_documento_seia.SourceAddError(
+                        Path(path_str).name,
+                        message="Failed to get SOURCE_ID from registration response",
+                    )
+                return SimpleNamespace(
+                    id="source-rewritten",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        def fake_rewrite(source_path, output_path):
+            Path(output_path).write_bytes(b"rewritten-pdf")
+            return Path(output_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "estabilidad.pdf"
+            source_path.write_bytes(b"original-pdf")
+            upload_name = "EIA_Estabilidad_Fisica.pdf"
+
+            with patch.object(download_documento_seia, "NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", 1), patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ), patch.object(
+                download_documento_seia,
+                "_rewrite_pdf_for_notebook",
+                side_effect=fake_rewrite,
+            ), patch.object(
+                download_documento_seia,
+                "_flatten_ocr_pdf_for_notebook",
+            ) as fake_ocr:
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["upload_variant"], "reescrito")
+        self.assertEqual(result["upload_total_attempts"], 2)
+        self.assertIn(b"original-pdf", captured["payloads"])
+        self.assertIn(b"rewritten-pdf", captured["payloads"])
+        self.assertFalse(fake_ocr.called)
+        self.assertEqual(result["response_body"]["item"]["title"], upload_name)
+
+    def test_upload_single_document_ocr_pdf_after_rewrite_upload_failure(self):
+        captured = {"payloads": []}
+
+        class FakeSources:
+            async def list(self, notebook_id):
+                return []
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                payload = Path(path_str).read_bytes()
+                captured["payloads"].append(payload)
+                if payload != b"ocr-pdf":
+                    raise download_documento_seia.SourceAddError(
+                        Path(path_str).name,
+                        message="Failed to get SOURCE_ID from registration response",
+                    )
+                return SimpleNamespace(
+                    id="source-ocr",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        def fake_rewrite(source_path, output_path):
+            Path(output_path).write_bytes(b"rewritten-pdf")
+            return Path(output_path)
+
+        def fake_ocr(source_path, output_path):
+            Path(output_path).write_bytes(b"ocr-pdf")
+            return Path(output_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "estabilidad.pdf"
+            source_path.write_bytes(b"original-pdf")
+            upload_name = "EIA_Estabilidad_Fisica.pdf"
+
+            with patch.object(download_documento_seia, "NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", 1), patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ), patch.object(
+                download_documento_seia,
+                "_rewrite_pdf_for_notebook",
+                side_effect=fake_rewrite,
+            ), patch.object(
+                download_documento_seia,
+                "_flatten_ocr_pdf_for_notebook",
+                side_effect=fake_ocr,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["upload_variant"], "aplanado+OCR")
+        self.assertEqual(result["upload_total_attempts"], 3)
+        self.assertEqual(
+            captured["payloads"],
+            [b"original-pdf", b"rewritten-pdf", b"ocr-pdf"],
+        )
+        self.assertEqual(result["response_body"]["item"]["title"], upload_name)
+
 
 class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
     def test_rar_extractors_prefer_7z_then_unar_then_unrar(self):
