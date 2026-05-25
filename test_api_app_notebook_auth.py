@@ -1373,7 +1373,7 @@ class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
                 download_documento_seia,
                 "_flatten_ocr_pdf_for_notebook",
                 side_effect=fake_ocr,
-            ):
+            ), patch.object(download_documento_seia, "NOTEBOOK_PDF_OCR_ENABLED", True):
                 result = download_documento_seia._upload_single_document(
                     "notebook-1",
                     {
