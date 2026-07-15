@@ -7,6 +7,7 @@ import json
 import tempfile
 import unittest
 import zipfile
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -14,6 +15,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 from fastapi.testclient import TestClient
 
 import api_app
+import download_documento_seia
 
 
 def _encode_auth_header(payload: dict) -> str:
@@ -35,6 +37,27 @@ def _headers(include_notebook_auth: bool = True) -> dict[str, str]:
             }
         )
     return headers
+
+
+class _FakeDownloadResponse:
+    def __init__(self, chunks, headers=None, status_code=200, error=None):
+        self._chunks = list(chunks)
+        self.headers = headers or {}
+        self.status_code = status_code
+        self.error = error
+        self.closed = False
+
+    def raise_for_status(self):
+        return None
+
+    def iter_content(self, chunk_size):
+        for chunk in self._chunks:
+            yield chunk
+        if self.error:
+            raise self.error
+
+    def close(self):
+        self.closed = True
 
 
 def _document_row(document_id: str = "doc-1") -> dict:
@@ -128,6 +151,128 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
         self.assertTrue(payload["token_fetch_ok"])
         self.assertEqual(payload["auth_payload"]["cookies"]["SID"], "sid-http-only")
         self.assertIn("SID", payload["selected_cookie_names"])
+
+    def test_validate_cookies_accepts_chrome_host_only_google_sid(self):
+        raw_cookies = "\n".join(
+            [
+                "google.com\tFALSE\t/\tTRUE\t2147483647\tSID\tsid-host-only",
+                "google.com\tFALSE\t/\tFALSE\t2147483647\tAPISID\tapisid-host-only",
+                "notebooklm.google.com\tFALSE\t/\tTRUE\t2147483647\tOSID\tosid-host-only",
+            ]
+        )
+
+        with patch.object(
+            api_app,
+            "fetch_tokens",
+            AsyncMock(return_value=("csrf-token", "session-id")),
+        ) as fetch_tokens:
+            response = self.client.post(
+                "/auth/validate-cookies",
+                json={"cookies_text": raw_cookies},
+                headers=_headers(include_notebook_auth=False),
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["ok"])
+        self.assertEqual(payload["auth_payload"]["cookies"]["SID"], "sid-host-only")
+        self.assertIn("google.com", payload["cookie_domains"])
+        self.assertIn("SID", payload["selected_cookie_names"])
+        self.assertEqual(fetch_tokens.call_args.args[0]["SID"], "sid-host-only")
+
+    def test_store_credentials_persists_only_after_token_fetch_works(self):
+        storage_state = {
+            "cookies": [
+                {
+                    "name": "SID",
+                    "value": "sid-valid",
+                    "domain": ".google.com",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                }
+            ],
+            "origins": [],
+        }
+        stored_row = {
+            "user_id": "user-1",
+            "payload_enc": "enc",
+            "status": "valid",
+            "validated_at": "2026-06-02T19:00:00+00:00",
+            "last_checked_at": "2026-06-02T19:00:00+00:00",
+            "last_used_at": None,
+            "cookie_names": ["SID"],
+            "last_error": "",
+            "failure_count": 0,
+        }
+        headers = _headers(include_notebook_auth=False)
+        headers[api_app.NOTEBOOK_USER_JWT_HEADER] = "user-jwt"
+
+        with patch.object(api_app, "_resolve_user_id_from_jwt", return_value="user-1"), patch.object(
+            api_app,
+            "get_supabase_client",
+            return_value=object(),
+        ), patch.object(
+            api_app,
+            "fetch_tokens",
+            AsyncMock(return_value=("csrf-token", "session-id")),
+        ) as fetch_tokens, patch.object(
+            api_app,
+            "store_credentials",
+            return_value=stored_row,
+        ) as store_credentials:
+            response = self.client.post(
+                "/api/v1/adenda/notebook/credentials",
+                json={"cookies_text": json.dumps(storage_state)},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertTrue(payload["valid"])
+        self.assertEqual(payload["status"], "valid")
+        fetch_tokens.assert_awaited_once()
+        store_credentials.assert_called_once()
+        self.assertEqual(store_credentials.call_args.kwargs["status"], "valid")
+
+    def test_store_credentials_rejects_token_fetch_failure_without_persisting(self):
+        storage_state = {
+            "cookies": [
+                {
+                    "name": "SID",
+                    "value": "sid-invalid",
+                    "domain": ".google.com",
+                    "path": "/",
+                    "secure": True,
+                    "httpOnly": True,
+                }
+            ],
+            "origins": [],
+        }
+        headers = _headers(include_notebook_auth=False)
+        headers[api_app.NOTEBOOK_USER_JWT_HEADER] = "user-jwt"
+
+        with patch.object(api_app, "_resolve_user_id_from_jwt", return_value="user-1"), patch.object(
+            api_app,
+            "fetch_tokens",
+            AsyncMock(side_effect=Exception("Redirected to Google login.")),
+        ), patch.object(
+            api_app,
+            "store_credentials",
+        ) as store_credentials, patch.object(
+            api_app,
+            "mark_credentials_status",
+        ) as mark_credentials_status:
+            response = self.client.post(
+                "/api/v1/adenda/notebook/credentials",
+                json={"cookies_text": json.dumps(storage_state)},
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 422)
+        self.assertIn("Cookies no validas", response.json()["detail"])
+        store_credentials.assert_not_called()
+        mark_credentials_status.assert_not_called()
 
     def test_revalidate_stored_credentials_marks_valid_when_tokens_work(self):
         stored_row = {
@@ -248,6 +393,103 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
         self.assertEqual(mark_status.call_args.kwargs["event_type"], "revalidate")
         self.assertFalse(mark_status.call_args.kwargs["event_ok"])
 
+    def test_credentials_status_needs_validation_is_not_valid(self):
+        payload = api_app._notebook_credentials_status_payload(
+            {
+                "user_id": "user-1",
+                "payload_enc": "enc",
+                "status": "needs_validation",
+                "validated_at": "2026-04-28T20:36:56+00:00",
+                "last_checked_at": "2026-04-28T21:12:40+00:00",
+                "last_used_at": None,
+                "cookie_names": ["SID"],
+                "last_error": "fetch_tokens fallo",
+                "failure_count": 0,
+            }
+        )
+
+        self.assertTrue(payload.has_credentials)
+        self.assertFalse(payload.valid)
+        self.assertEqual(payload.status, "needs_validation")
+
+    def test_wait_for_refreshed_notebook_auth_returns_fresh_valid_credentials(self):
+        row = {
+            "status": "valid",
+            "payload_enc": "enc",
+            "updated_at": "2026-05-05T18:00:00+00:00",
+            "last_checked_at": "2026-05-05T18:00:00+00:00",
+        }
+        auth_seed = {"cookies": {"SID": "sid-fresh"}, "csrf_token": "csrf", "session_id": "sess"}
+
+        with patch.object(api_app, "load_credentials", return_value=row), patch.object(
+            api_app,
+            "decrypt_payload",
+            return_value={"version": 1, "cookies": {"SID": "sid-fresh"}},
+        ), patch.object(
+            api_app,
+            "prepare_notebook_client_seed",
+            return_value=auth_seed,
+        ) as prepare_seed:
+            result = api_app._wait_for_refreshed_notebook_auth(
+                object(),
+                "user-1",
+                after=datetime(2026, 5, 5, 17, 59, tzinfo=timezone.utc),
+                wait_sec=0,
+            )
+
+        self.assertIsNotNone(result)
+        notebook_auth, returned_seed = result
+        self.assertEqual(notebook_auth["cookies"]["SID"], "sid-fresh")
+        self.assertEqual(notebook_auth["_credentials_source"], "stored")
+        self.assertEqual(notebook_auth["_credentials_user_id"], "user-1")
+        self.assertEqual(returned_seed, auth_seed)
+        prepare_seed.assert_called_once()
+
+    def test_wait_for_refreshed_notebook_auth_ignores_stale_valid_credentials(self):
+        row = {
+            "status": "valid",
+            "payload_enc": "enc",
+            "updated_at": "2026-05-05T17:00:00+00:00",
+            "last_checked_at": "2026-05-05T17:00:00+00:00",
+        }
+
+        with patch.object(api_app, "load_credentials", return_value=row), patch.object(
+            api_app,
+            "prepare_notebook_client_seed",
+        ) as prepare_seed:
+            result = api_app._wait_for_refreshed_notebook_auth(
+                object(),
+                "user-1",
+                after=datetime(2026, 5, 5, 18, 0, tzinfo=timezone.utc),
+                wait_sec=0,
+            )
+
+        self.assertIsNone(result)
+        prepare_seed.assert_not_called()
+
+    def test_list_notebooks_accepts_trailing_slash_without_redirect(self):
+        fake_notebook = SimpleNamespace(id="nb-1", title="Notebook usuario")
+
+        with patch.object(
+            api_app,
+            "run_notebook_share_operation",
+            return_value=[fake_notebook],
+        ) as run_operation:
+            response = self.client.get(
+                "/notebooks/",
+                headers=_headers(),
+                follow_redirects=False,
+            )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {"ok": True, "items": [{"id": "nb-1", "title": "Notebook usuario"}]},
+        )
+        run_operation.assert_called_once()
+        notebook_auth = run_operation.call_args.args[0]
+        self.assertEqual(notebook_auth["cookies"]["SID"], "sid-base")
+
     def test_create_selection_with_new_notebook_propagates_header_auth(self):
         process_upload = MagicMock(return_value=None)
 
@@ -356,6 +598,51 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
         self.assertEqual(notebook_auth["cookies"]["SID"], "sid-stored")
         self.assertEqual(notebook_auth["_credentials_source"], "stored")
         self.assertEqual(notebook_auth["_credentials_user_id"], "user-1")
+
+    def test_create_selection_rejects_needs_validation_credentials(self):
+        stored_row = {
+            "user_id": "user-1",
+            "payload_enc": "enc",
+            "status": "needs_validation",
+            "validated_at": "2026-04-28T20:36:56+00:00",
+            "last_checked_at": "2026-04-28T21:12:40+00:00",
+            "last_used_at": None,
+            "cookie_names": ["SID"],
+            "last_error": "fetch_tokens fallo",
+            "failure_count": 0,
+        }
+        headers = _headers(include_notebook_auth=False)
+        headers[api_app.NOTEBOOK_USER_JWT_HEADER] = "user-jwt"
+
+        with patch.object(api_app, "_resolve_user_id_from_jwt", return_value="user-1"), patch.object(
+            api_app,
+            "get_supabase_client",
+            return_value=object(),
+        ), patch.object(
+            api_app,
+            "load_credentials",
+            return_value=stored_row,
+        ), patch.object(
+            api_app,
+            "decrypt_payload",
+        ) as decrypt_payload, patch.object(
+            api_app,
+            "load_run",
+        ) as load_run:
+            response = self.client.post(
+                "/api/v1/adenda/crear-y-cargar-notebook-filtrado",
+                json={
+                    "run_id": "run-1",
+                    "nombre_notebook": "Notebook usuario",
+                    "selected_document_ids": ["doc-1"],
+                },
+                headers=headers,
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("credenciales NotebookLM validas", response.json()["detail"])
+        decrypt_payload.assert_not_called()
+        load_run.assert_not_called()
 
     def test_create_selection_with_existing_notebook_keeps_notebook_id_and_auth(self):
         process_upload = MagicMock(return_value=None)
@@ -584,9 +871,113 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
             notebook_name = api_app.build_notebook_upload_filename(row)
             self.assertTrue(notebook_name.endswith(".pdf"))
             self.assertNotIn(".", Path(notebook_name).stem)
-            self.assertIn("-", Path(notebook_name).stem)
+            self.assertLessEqual(
+                len(notebook_name),
+                download_documento_seia.NOTEBOOK_UPLOAD_FILENAME_MAX_LEN,
+            )
 
-    def test_retry_upload_forwards_notebook_auth_to_upload_helper(self):
+    def test_semantic_names_replace_internal_dots_only(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            descriptive_row = {
+                "tipo": "EIA",
+                "categoria": "Descripcion del proyecto o actividad",
+                "texto_link": "Anexo 1.1 Antecedentes Legales",
+                "nombre_archivo": "CI Stephanie Wilhelm.pdf",
+                "ruta_relativa": "CI Stephanie Wilhelm.pdf",
+            }
+            coded_row = {
+                "tipo": "EIA",
+                "categoria": "",
+                "texto_link": "",
+                "nombre_archivo": "C2304-MA-EIA-001-ANX1.3.1_REV.3.pdf",
+                "ruta_relativa": "C2304-MA-EIA-001-ANX1.3.1_REV.3.pdf",
+            }
+
+            descriptive_name = download_documento_seia.build_semantic_final_filename(
+                descriptive_row,
+                Path(tmp_dir),
+            )
+            coded_name = download_documento_seia.build_semantic_final_filename(
+                coded_row,
+                Path(tmp_dir),
+            )
+
+        self.assertEqual(
+            descriptive_name,
+            "EIA_Descripcion_del_proyecto_o_actividad_Anexo_1-1_Antecedentes_Legales_CI_Stephanie_Wilhelm.pdf",
+        )
+        self.assertEqual(coded_name, "EIA_C2304-MA-EIA-001-ANX1-3-1_REV-3.pdf")
+        self.assertEqual(api_app.build_notebook_upload_filename(descriptive_row), descriptive_name)
+        self.assertEqual(api_app.build_notebook_upload_filename(coded_row), coded_name)
+        self.assertNotIn(".", Path(descriptive_name).stem)
+        self.assertNotIn(".", Path(coded_name).stem)
+
+    def test_zip_entry_filename_keeps_short_parts_until_global_limit(self):
+        row = {
+            "categoria": "Descripcion del proyecto o actividad",
+            "texto_link": "Anexo 1.1 Antecedentes Legales",
+            "nombre_archivo": "CI Stephanie Wilhelm.pdf",
+            "nombre_archivo_final": "",
+            "ruta_relativa": "CI Stephanie Wilhelm.pdf",
+            "formato": "pdf",
+        }
+
+        file_name = api_app.build_zip_entry_filename_from_row(
+            row,
+            tipo="EIA",
+            fallback_name="CI Stephanie Wilhelm.pdf",
+            index=1,
+        )
+
+        self.assertEqual(
+            file_name,
+            "EIA_Descripcion_del_proyecto_o_actividad_Anexo_1-1_Antecedentes_Legales_CI_Stephanie_Wilhelm.pdf",
+        )
+        self.assertLessEqual(len(file_name), api_app.ZIP_ENTRY_FILENAME_MAX_CHARS)
+        self.assertNotIn(".", Path(file_name).stem)
+
+    def test_retry_documents_zip_uses_flat_windows_safe_entry_names(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            relative_path = (
+                "Plan_de_cumplimiento/Anexo 13.03 PAS 137/Apéndice B/"
+                "DIA_Plan_de_cumplimiento_Anexo_13.03_Estudio_Estabilidad_Botaderos.pdf"
+            )
+            source_path = Path(tmp_dir) / relative_path
+            source_path.parent.mkdir(parents=True, exist_ok=True)
+            source_path.write_bytes(b"documento de prueba")
+            run = {
+                "id": "run-retry",
+                "tipo": "DIA",
+                "output_dir": tmp_dir,
+                "metadata": {"retry_upload_attempts": 1},
+            }
+            row = {
+                **_document_row("doc-retry"),
+                "categoria": "Plan de cumplimiento de la legislacion ambiental aplicable",
+                "texto_link": "Anexo 13.03 PAS 137",
+                "nombre_archivo": source_path.name,
+                "nombre_archivo_final": source_path.name,
+                "ruta_relativa": relative_path,
+                "upload_status": "not_uploaded",
+            }
+
+            zip_path = api_app.build_retry_documents_zip(run, [row])
+
+            with zipfile.ZipFile(zip_path, "r") as zip_file:
+                entry_names = [
+                    name
+                    for name in zip_file.namelist()
+                    if name.startswith("documentos_fallidos/")
+                ]
+
+        self.assertEqual(len(entry_names), 1)
+        entry_name = entry_names[0]
+        self.assertEqual(entry_name.count("/"), 1)
+        file_name = Path(entry_name).name
+        self.assertLessEqual(len(file_name), api_app.ZIP_ENTRY_FILENAME_MAX_CHARS)
+        self.assertNotIn(".", Path(file_name).stem)
+
+    def test_retry_upload_queues_background_upload_with_notebook_auth(self):
         fake_supabase = _FakeSupabase(failed_rows=[_document_row()])
         auth_seed = {"cookies": {"SID": "sid-base"}, "csrf_token": "csrf", "session_id": "sess"}
 
@@ -614,13 +1005,9 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
             return_value=[],
         ), patch.object(
             api_app,
-            "upload_documents_batch_and_single",
-            return_value={
-                "uploaded_ok": 1,
-                "uploaded_failed": 0,
-                "items": [{"document_id": "doc-1", "uploaded": True}],
-            },
-        ) as upload_documents, patch.object(
+            "process_notebook_upload_background",
+            return_value=None,
+        ) as process_upload, patch.object(
             api_app,
             "load_run_documents",
             return_value=[],
@@ -644,9 +1031,27 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
             )
 
         self.assertEqual(response.status_code, 200)
-        kwargs = upload_documents.call_args.kwargs
-        self.assertEqual(kwargs["notebook_auth"]["cookies"]["SID"], "sid-base")
-        self.assertEqual(kwargs["auth_seed"], auth_seed)
+        payload = response.json()
+        self.assertEqual(payload["status"], "uploading")
+        self.assertEqual(payload["retry_documents_count"], 1)
+        process_upload.assert_called_once()
+        args = process_upload.call_args.args
+        self.assertEqual(args[0], "run-1")
+        self.assertEqual(args[1], ["doc-1"])
+        self.assertEqual(args[3], "nb-123")
+        self.assertEqual(args[4]["cookies"]["SID"], "sid-base")
+
+    def test_retry_upload_rejects_without_notebook_auth(self):
+        with patch.object(api_app, "get_supabase_client") as get_supabase_client:
+            response = self.client.post(
+                "/api/v1/adenda/reintentar-carga-notebook",
+                json={"run_id": "run-1"},
+                headers=_headers(include_notebook_auth=False),
+            )
+
+        self.assertEqual(response.status_code, 401)
+        self.assertIn("credenciales NotebookLM validas", response.json()["detail"])
+        get_supabase_client.assert_not_called()
 
     def test_retry_upload_rejects_when_notebook_has_no_capacity(self):
         fake_supabase = _FakeSupabase(failed_rows=[_document_row()])
@@ -694,6 +1099,100 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
         set_retry_attempts.assert_not_called()
         upload_documents.assert_not_called()
 
+    def test_background_upload_waits_for_fresh_credentials_and_resumes(self):
+        failed_row = {**_document_row("doc-failed"), "upload_status": "failed"}
+        pending_row = {**_document_row("doc-pending"), "upload_status": "not_uploaded"}
+        rows_by_id = {
+            "doc-failed": failed_row,
+            "doc-pending": pending_row,
+        }
+        fake_supabase = _FakeSupabase(failed_rows=[failed_row, pending_row])
+        stale_auth = {
+            "version": 1,
+            "cookies": {"SID": "sid-stale"},
+            "_credentials_source": "stored",
+            "_credentials_user_id": "user-1",
+        }
+        fresh_auth = {
+            "version": 1,
+            "cookies": {"SID": "sid-fresh"},
+            "_credentials_source": "stored",
+            "_credentials_user_id": "user-1",
+        }
+        seed_stale = {"cookies": {"SID": "sid-stale"}, "csrf_token": "csrf-old", "session_id": "sess-old"}
+        seed_fresh = {"cookies": {"SID": "sid-fresh"}, "csrf_token": "csrf-new", "session_id": "sess-new"}
+        run = {
+            "id": "run-1",
+            "tipo": "ifa",
+            "id_documento": "123",
+            "output_dir": "C:\\temp",
+            "notebooklm_id": "nb-123",
+            "nombre_notebooklm": "Notebook usuario",
+            "metadata": {},
+        }
+
+        def load_selected(_client, _run_id, selected_ids):
+            return [rows_by_id[doc_id] for doc_id in selected_ids]
+
+        with patch.object(api_app, "get_supabase_client", return_value=fake_supabase), patch.object(
+            api_app,
+            "load_run",
+            return_value=run,
+        ), patch.object(
+            api_app,
+            "load_selected_documents",
+            side_effect=load_selected,
+        ) as load_selected_documents, patch.object(
+            api_app,
+            "prepare_notebook_client_seed",
+            side_effect=[seed_stale, seed_fresh],
+        ), patch.object(
+            api_app,
+            "upload_documents_batch_and_single",
+            side_effect=[
+                api_app.NotebookCredentialsExpired("cookies caducas"),
+                {"uploaded_ok": 1, "uploaded_failed": 0, "items": [{"document_id": "doc-pending", "uploaded": True}]},
+            ],
+        ) as upload_documents, patch.object(
+            api_app,
+            "mark_credentials_status",
+            return_value={
+                "status": "expired",
+                "updated_at": "2026-05-05T18:00:00+00:00",
+                "last_checked_at": "2026-05-05T18:00:00+00:00",
+            },
+        ), patch.object(
+            api_app,
+            "_wait_for_refreshed_notebook_auth",
+            return_value=(fresh_auth, seed_fresh),
+        ) as wait_for_auth, patch.object(
+            api_app,
+            "mark_remaining_documents_for_retry",
+            side_effect=[["doc-pending"], []],
+        ) as mark_remaining, patch.object(
+            api_app,
+            "_touch_stored_notebook_credentials",
+            return_value=None,
+        ):
+            api_app.process_notebook_upload_background(
+                "run-1",
+                ["doc-failed", "doc-pending"],
+                None,
+                "nb-123",
+                stale_auth,
+            )
+
+        self.assertEqual(upload_documents.call_count, 2)
+        wait_for_auth.assert_called_once()
+        self.assertEqual(upload_documents.call_args.kwargs["notebook_auth"]["cookies"]["SID"], "sid-fresh")
+        self.assertEqual(load_selected_documents.call_args_list[1].args[2], ["doc-pending"])
+        self.assertEqual(
+            [doc["document_id"] for doc in upload_documents.call_args.kwargs["docs_report"]],
+            ["doc-pending"],
+        )
+        self.assertEqual(mark_remaining.call_args_list[0].kwargs["selected_ids"], ["doc-failed", "doc-pending"])
+        self.assertEqual(mark_remaining.call_args_list[1].kwargs["selected_ids"], ["doc-pending"])
+
     def test_legacy_endpoint_keeps_working_without_notebook_auth_header(self):
         with patch.object(api_app, "get_supabase_client", return_value=object()), patch.object(
             api_app,
@@ -725,6 +1224,614 @@ class ApiAppNotebookAuthTests(unittest.TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(run_pipeline.call_args.kwargs["notebook_auth"])
+
+    def test_persist_cp6b_result_marks_listing_warnings(self):
+        actions = []
+
+        class CaptureTable:
+            def __init__(self, table_name):
+                self.table_name = table_name
+
+            def delete(self):
+                actions.append((self.table_name, "delete", None))
+                return self
+
+            def insert(self, payload):
+                actions.append((self.table_name, "insert", payload))
+                return self
+
+            def update(self, payload):
+                actions.append((self.table_name, "update", payload))
+                return self
+
+            def eq(self, *_args, **_kwargs):
+                return self
+
+            def execute(self):
+                return SimpleNamespace(data=[])
+
+        class CaptureClient:
+            def table(self, table_name):
+                return CaptureTable(table_name)
+
+        result = {
+            "status": "listed_with_warnings",
+            "tipo": "EIA",
+            "failed_compressed_downloads": [
+                {
+                    "index": 7,
+                    "nombre_archivo": "Anexo fallido.rar",
+                    "texto_link": "Anexo fallido",
+                    "categoria": "Anexos",
+                    "url": "https://seia.example/anexo_fallido.rar",
+                    "url_origen": "https://seia.example/anexo_fallido.rar",
+                    "extension": ".rar",
+                    "formato": "rar",
+                    "tamano_bytes": 123,
+                    "error": "timeout",
+                }
+            ],
+            "docs_report": [
+                {
+                    "nombre_archivo": "archivo.pdf",
+                    "nombre_archivo_final": "archivo.pdf",
+                    "extension": ".pdf",
+                    "formato": "pdf",
+                    "ruta_relativa": "archivo.pdf",
+                    "tamano_bytes": 0,
+                    "nivel_descarga_descompresion": 0,
+                    "origen": "otro",
+                    "categoria": "Anexo",
+                    "texto_link": "Anexo 1",
+                    "url_origen": "https://seia.example/archivo.rar",
+                }
+            ],
+            "trace_stats": {
+                "listing_warning_message": "Listado generado con advertencias: 1 PDF con 0 bytes.",
+                "pdf_zero_bytes": 1,
+            },
+        }
+
+        api_app.persist_cp6b_run_result(CaptureClient(), "run-1", result)
+
+        run_update = [
+            payload
+            for table, action, payload in actions
+            if table == "adenda_document_runs" and action == "update"
+        ][0]
+        self.assertEqual(run_update["status"], "listed_with_warnings")
+        self.assertEqual(run_update["progress_stage"], "listed")
+        self.assertIn("advertencias", run_update["progress_message"])
+        self.assertEqual(run_update["error_message"], result["trace_stats"]["listing_warning_message"])
+        self.assertEqual(
+            run_update["trace_stats"]["failed_compressed_downloads"][0]["url"],
+            "https://seia.example/anexo_fallido.rar",
+        )
+        self.assertEqual(run_update["trace_stats"]["failed_compressed_downloads_count"], 1)
+
+
+class DownloadDocumentoSeiaDownloadTests(unittest.TestCase):
+    def _download_doc(self, size_bytes=10):
+        return {
+            "index": 1,
+            "name": "Anexo prueba.rar",
+            "url": "https://example.test/anexo.rar",
+            "section": "Documentos",
+            "file_type": ".rar",
+            "size_bytes": size_bytes,
+            "download_path": None,
+            "status": "pending",
+            "error": None,
+        }
+
+    def test_download_file_resumes_after_incomplete_stream(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            first_error = download_documento_seia.requests.exceptions.ChunkedEncodingError("corte")
+            responses = [
+                _FakeDownloadResponse([b"abc"], {"Content-Length": "10"}, error=first_error),
+                _FakeDownloadResponse(
+                    [b"defghij"],
+                    {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+                    status_code=206,
+                ),
+            ]
+
+            with patch.object(download_documento_seia, "safe_request", side_effect=responses) as safe_request, patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                2,
+            ), patch.object(download_documento_seia, "DOWNLOAD_RETRY_BASE_SEC", 0):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdefghij")
+            self.assertEqual(doc["status"], "done")
+            self.assertFalse(list(output_dir.rglob("*.part")))
+            self.assertEqual(
+                safe_request.call_args_list[1].kwargs["headers"]["Range"],
+                "bytes=3-",
+            )
+
+    def test_download_file_retries_short_response_without_exception(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            responses = [
+                _FakeDownloadResponse([b"abc"], {"Content-Length": "10"}),
+                _FakeDownloadResponse(
+                    [b"defghij"],
+                    {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+                    status_code=206,
+                ),
+            ]
+
+            with patch.object(download_documento_seia, "safe_request", side_effect=responses), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                2,
+            ), patch.object(download_documento_seia, "DOWNLOAD_RETRY_BASE_SEC", 0):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdefghij")
+            self.assertEqual(doc["size_bytes"], 10)
+
+    def test_download_file_reports_byte_progress(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=6)
+            response = _FakeDownloadResponse(
+                [b"abc", b"def"],
+                {"Content-Length": "6"},
+            )
+            events = []
+
+            with patch.object(download_documento_seia, "safe_request", return_value=response):
+                path, error = download_documento_seia.download_file(
+                    object(),
+                    doc,
+                    output_dir,
+                    progress_callback=lambda current, total, event: events.append(
+                        (current, total, event)
+                    ),
+                )
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdef")
+            self.assertIn((3, 6, "downloading"), events)
+            self.assertIn((6, 6, "completed"), events)
+
+    def test_build_failed_compressed_downloads_filters_only_failed_archives(self):
+        docs = [
+            {
+                **self._download_doc(size_bytes=123),
+                "status": "error",
+                "error": "timeout",
+            },
+            {
+                **self._download_doc(size_bytes=456),
+                "name": "Documento PDF",
+                "url": "https://example.test/documento.pdf",
+                "file_type": ".pdf",
+                "status": "error",
+                "error": "timeout",
+            },
+            {
+                **self._download_doc(size_bytes=789),
+                "name": "Comprimido ok",
+                "url": "https://example.test/comprimido.zip",
+                "file_type": ".zip",
+                "status": "done",
+            },
+        ]
+
+        failed = download_documento_seia.build_failed_compressed_downloads(docs)
+
+        self.assertEqual(len(failed), 1)
+        self.assertEqual(failed[0]["nombre_archivo"], "Anexo prueba.rar")
+        self.assertEqual(failed[0]["url"], "https://example.test/anexo.rar")
+        self.assertEqual(failed[0]["extension"], ".rar")
+        self.assertEqual(failed[0]["error"], "timeout")
+
+    def test_download_all_parallel_uses_bounded_workers(self):
+        docs = [
+            {**self._download_doc(size_bytes=5), "index": 1, "name": "a.pdf", "url": "https://example.test/a.pdf"},
+            {**self._download_doc(size_bytes=7), "index": 2, "name": "b.pdf", "url": "https://example.test/b.pdf"},
+            {**self._download_doc(size_bytes=11), "index": 3, "name": "c.pdf", "url": "https://example.test/c.pdf"},
+        ]
+        progress_events = []
+
+        def fake_download_file(_session, doc, _output_dir, progress_callback=None):
+            size = doc["size_bytes"]
+            if progress_callback:
+                progress_callback(size, size, "completed")
+            doc["status"] = "done"
+            return Path(doc["name"]), None
+
+        with tempfile.TemporaryDirectory() as tmp_dir, patch.object(
+            download_documento_seia,
+            "DOWNLOAD_MAX_WORKERS",
+            2,
+        ), patch.object(
+            download_documento_seia,
+            "download_file",
+            side_effect=fake_download_file,
+        ), patch.object(download_documento_seia, "create_session", return_value=object()):
+            done, failed, total_bytes, _elapsed = download_documento_seia.download_all(
+                object(),
+                docs,
+                Path(tmp_dir),
+                progress_callback=progress_events.append,
+            )
+
+        self.assertEqual(done, 3)
+        self.assertEqual(failed, 0)
+        self.assertEqual(total_bytes, 23)
+        self.assertEqual(progress_events[-1]["current"], 23)
+        self.assertEqual(progress_events[-1]["total"], 23)
+        self.assertEqual(progress_events[-1]["done"], 3)
+
+    def test_download_progress_tracker_throttles_chunk_updates(self):
+        doc = self._download_doc(size_bytes=100)
+        progress_events = []
+        tracker = download_documento_seia._DownloadProgressTracker(
+            [doc],
+            progress_callback=progress_events.append,
+        )
+        callback = tracker.item_callback(0, doc)
+
+        with patch.object(download_documento_seia, "DOWNLOAD_PROGRESS_MIN_INTERVAL_SEC", 999):
+            callback(10, 100, "downloading")
+            callback(20, 100, "downloading")
+            callback(30, 100, "downloading")
+            callback(100, 100, "completed")
+
+        self.assertEqual(len(progress_events), 2)
+        self.assertEqual(progress_events[0]["current"], 10)
+        self.assertEqual(progress_events[1]["current"], 100)
+
+    def test_download_file_removes_temp_after_final_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            response = _FakeDownloadResponse([b"abc"], {"Content-Length": "10"})
+
+            with patch.object(download_documento_seia, "safe_request", return_value=response), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                1,
+            ):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(path)
+            self.assertIn("descarga incompleta", error)
+            self.assertEqual(doc["status"], "error")
+            self.assertFalse(list(output_dir.rglob("*.part")))
+            self.assertFalse(list(output_dir.rglob("*.rar")))
+
+    def test_cp6b_listing_quality_flags_partial_extraction_signals(self):
+        quality = download_documento_seia.build_cp6b_listing_quality(
+            [
+                {
+                    "extension": ".pdf",
+                    "origen": "otro",
+                    "tamano_bytes": 0,
+                },
+                {
+                    "extension": ".pdf",
+                    "origen": "descompresion",
+                    "tamano_bytes": 100,
+                },
+            ],
+            downloaded_failed=0,
+            extraction_failed=2,
+        )
+
+        self.assertTrue(quality["has_warnings"])
+        self.assertIn("extraction_failed", quality["warning_flags"])
+        self.assertIn("untracked_pdf_origin", quality["warning_flags"])
+        self.assertIn("zero_byte_pdf", quality["warning_flags"])
+        self.assertEqual(quality["pdf_origen_otro"], 1)
+        self.assertEqual(quality["pdf_zero_bytes"], 1)
+
+
+class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
+    def test_staging_filename_is_short_and_has_no_internal_dots(self):
+        name = (
+            "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+            "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+        )
+
+        staging_name = download_documento_seia.build_notebook_upload_staging_filename(name)
+
+        self.assertTrue(staging_name.endswith(".pdf"))
+        self.assertLessEqual(
+            len(staging_name),
+            download_documento_seia.NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", Path(staging_name).stem)
+
+    def test_upload_single_document_uses_short_staging_file_before_rename(self):
+        captured = {}
+
+        class FakeSources:
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["add_file_path"] = path_str
+                self_outer.assertTrue(Path(path_str).exists())
+                return SimpleNamespace(
+                    id="source-1",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        self_outer = self
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            long_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+            )
+            source_path = Path(tmp_dir) / long_name
+            source_path.write_bytes(b"%PDF-1.4\n")
+            upload_name = download_documento_seia.build_notebook_upload_filename(
+                {
+                    "tipo": "EIA",
+                    "categoria": "Minera HMC S.A Rep. Legal Jose Miguel Ibanez Anrique",
+                    "texto_link": "Anexo 3.2 PAS 136",
+                    "nombre_archivo": long_name,
+                    "nombre_archivo_final": long_name,
+                    "ruta_relativa": long_name,
+                }
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": long_name,
+                        "nombre_archivo": long_name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        add_file_path = Path(captured["add_file_path"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(captured["rename_title"], upload_name)
+        self.assertLessEqual(
+            len(add_file_path.name),
+            download_documento_seia.NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", add_file_path.stem)
+        self.assertFalse(add_file_path.exists())
+
+    def test_upload_single_document_recovers_source_id_from_created_source(self):
+        captured = {}
+
+        class FakeSources:
+            def __init__(self):
+                self.list_calls = 0
+
+            async def list(self, notebook_id):
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    return []
+                staging_name = captured["staging_name"]
+                return [
+                    SimpleNamespace(
+                        id="source-recovered",
+                        title=staging_name,
+                        kind="PDF",
+                        status=3,
+                    )
+                ]
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["staging_name"] = Path(path_str).name
+                raise download_documento_seia.SourceAddError(
+                    captured["staging_name"],
+                    message="Failed to get SOURCE_ID from registration response",
+                )
+
+            async def _start_resumable_upload(self, notebook_id, filename, file_size, source_id):
+                captured["start_upload"] = {
+                    "filename": filename,
+                    "file_size": file_size,
+                    "source_id": source_id,
+                }
+                return "https://upload.example/session"
+
+            async def _upload_file_streaming(self, upload_url, file_path):
+                captured["upload_url"] = upload_url
+                captured["uploaded_path_exists"] = Path(file_path).exists()
+
+            async def wait_until_ready(self, notebook_id, source_id, timeout):
+                captured["wait"] = {"source_id": source_id, "timeout": timeout}
+                return SimpleNamespace(
+                    id=source_id,
+                    title=captured["staging_name"],
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "archivo_original.pdf"
+            source_path.write_bytes(b"%PDF-1.4\ncontent")
+            upload_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Modificacion_de_Proyecto_Modificacion_de_Proyecto.pdf"
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertIn("SOURCE_ID", result["warning"])
+        self.assertEqual(captured["start_upload"]["source_id"], "source-recovered")
+        self.assertEqual(captured["wait"]["source_id"], "source-recovered")
+        self.assertEqual(captured["rename_title"], upload_name)
+        self.assertTrue(captured["uploaded_path_exists"])
+
+
+class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
+    def test_rar_extractors_prefer_7z_then_unar_then_unrar(self):
+        with patch.object(download_documento_seia, "_find_7z_tool", return_value="/usr/bin/7z"), patch.object(
+            download_documento_seia,
+            "_find_unar_tool",
+            return_value="/usr/bin/unar",
+        ), patch.object(
+            download_documento_seia,
+            "_find_unrar_tool",
+            return_value="/usr/bin/unrar",
+        ):
+            extractors = download_documento_seia._find_rar_extractors()
+
+        self.assertEqual(
+            extractors,
+            [
+                ("7z", "/usr/bin/7z"),
+                ("unar", "/usr/bin/unar"),
+                ("unrar", "/usr/bin/unrar"),
+            ],
+        )
+
+    def test_rar_extraction_rejects_partial_nonzero_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_path = tmp_path / "archivo.rar"
+            extract_dir = tmp_path / "archivo"
+            archive_path.write_bytes(b"rar")
+
+            def fake_run(cmd, **_kwargs):
+                output_arg = next(arg for arg in cmd if str(arg).startswith("-o") and arg != "-o+")
+                output_dir = Path(str(output_arg)[2:])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "parcial.pdf").write_bytes(b"parcial")
+                return SimpleNamespace(returncode=2, stderr="CRC error", stdout="")
+
+            with patch.object(
+                download_documento_seia,
+                "_find_rar_extractors",
+                return_value=[("7z", "7z")],
+            ), patch.object(
+                download_documento_seia.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(
+                download_documento_seia.sys,
+                "platform",
+                "linux",
+            ):
+                count, error = download_documento_seia._extract_rar_with_unrar(
+                    archive_path,
+                    extract_dir,
+                )
+
+        self.assertEqual(count, 0)
+        self.assertIn("7z error (code 2)", error)
+        self.assertIn("extraccion parcial descartada", error)
+        self.assertFalse(extract_dir.exists())
+
+    def test_rar_extraction_falls_back_after_failed_7z(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_path = tmp_path / "archivo.rar"
+            extract_dir = tmp_path / "archivo"
+            archive_path.write_bytes(b"rar")
+
+            def fake_run(cmd, **_kwargs):
+                if cmd[0] == "7z":
+                    return SimpleNamespace(returncode=2, stderr="unsupported rar", stdout="")
+                output_dir = Path(cmd[cmd.index("-output-directory") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "final.pdf").write_bytes(b"final")
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            with patch.object(
+                download_documento_seia,
+                "_find_rar_extractors",
+                return_value=[("7z", "7z"), ("unar", "unar")],
+            ), patch.object(
+                download_documento_seia.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(
+                download_documento_seia.sys,
+                "platform",
+                "linux",
+            ):
+                count, error = download_documento_seia._extract_rar_with_unrar(
+                    archive_path,
+                    extract_dir,
+                )
+
+            self.assertIsNone(error)
+            self.assertEqual(count, 1)
+            self.assertTrue(any(path.name == "final.pdf" for path in extract_dir.rglob("*.pdf")))
 
 
 if __name__ == "__main__":

@@ -3,6 +3,7 @@ FROM python:3.11-slim
 RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     p7zip-full \
+    unar \
     unrar-free \
     && rm -rf /var/lib/apt/lists/*
 
@@ -18,6 +19,7 @@ COPY \
     notebook_auth_store.py \
     notebook_user_credentials_schema.sql \
     supabase_cp6b_schema.sql \
+    worker_app.py \
     ./
 
 ENV PYTHONUNBUFFERED=1 \

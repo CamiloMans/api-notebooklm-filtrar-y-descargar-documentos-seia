@@ -9,6 +9,12 @@ services:
       - .env
     environment:
       API_OUTPUT_ROOT: /data/downloads
+      RUN_JOBS_IN_WEB: "false"
+      SEIA_DOWNLOAD_MAX_WORKERS: "1"
+      SEIA_DOWNLOAD_RETRY_ATTEMPTS: "20"
+      SEIA_DOWNLOAD_READ_TIMEOUT_SEC: "600"
+      SEIA_DOWNLOAD_RETRY_BASE_SEC: "8"
+      SEIA_DOWNLOAD_FAILED_RETRY_PASSES: "1"
     restart: unless-stopped
     ports:
       - "127.0.0.1:8020:8000"
@@ -20,6 +26,33 @@ services:
       timeout: 5s
       start_period: 30s
       retries: 5
+    logging:
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  documentos-seia-worker:
+    build:
+      context: ./repos/documentos-seia
+      dockerfile: Dockerfile
+    command: ["python", "worker_app.py"]
+    env_file:
+      - .env
+    environment:
+      API_OUTPUT_ROOT: /data/downloads
+      RUN_JOBS_IN_WEB: "false"
+      MAX_CONCURRENT_JOBS: "1"
+      SEIA_DOWNLOAD_MAX_WORKERS: "1"
+      SEIA_DOWNLOAD_RETRY_ATTEMPTS: "20"
+      SEIA_DOWNLOAD_READ_TIMEOUT_SEC: "600"
+      SEIA_DOWNLOAD_RETRY_BASE_SEC: "8"
+      SEIA_DOWNLOAD_FAILED_RETRY_PASSES: "1"
+    restart: unless-stopped
+    healthcheck:
+      disable: true
+    volumes:
+      - /var/lib/documentos-seia-notebook/downloads:/data/downloads
     logging:
       driver: json-file
       options:

@@ -104,12 +104,22 @@ def getenv_positive_int(name: str, default: int) -> int:
     return max(1, parsed_value)
 
 
-MAX_CONCURRENT_JOBS = getenv_positive_int("MAX_CONCURRENT_JOBS", 3)
+def getenv_bool(name: str, default: bool) -> bool:
+    """Lee booleanos desde entorno aceptando valores comunes."""
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    return raw_value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+MAX_CONCURRENT_JOBS = getenv_positive_int("MAX_CONCURRENT_JOBS", 1)
+RUN_JOBS_IN_WEB = getenv_bool("RUN_JOBS_IN_WEB", True)
 _SUPABASE_CLIENT: Optional[Client] = None
 _JOB_SEMAPHORE = threading.BoundedSemaphore(MAX_CONCURRENT_JOBS)
 RETRYABLE_UPLOAD_STATUSES = ("failed", "not_uploaded", "selected", "uploading", "pending")
 NOTEBOOK_AUTH_HEADER = "X-NotebookLM-Auth"
 NOTEBOOK_USER_JWT_HEADER = "X-Myma-User-JWT"
+NOTEBOOK_CREDENTIALS_USER_ID_METADATA_KEY = "notebook_credentials_user_id"
 ZIP_EXPORT_PART_SIZE_BYTES = getenv_positive_int("ZIP_EXPORT_PART_SIZE_BYTES", 8 * 1024 * 1024)
 ZIP_ENTRY_FILENAME_MAX_CHARS = max(32, getenv_positive_int("ZIP_ENTRY_FILENAME_MAX_CHARS", 140))
 ZIP_ENTRY_PART_LIMITS = (18, 32, 42, 42)
@@ -124,6 +134,8 @@ NOTEBOOK_KEEPALIVE_INTERVAL_SEC = getenv_positive_int("NOTEBOOK_KEEPALIVE_INTERV
 NOTEBOOK_KEEPALIVE_ACTIVE_DAYS = getenv_positive_int("NOTEBOOK_KEEPALIVE_ACTIVE_DAYS", 7)
 NOTEBOOK_KEEPALIVE_MAX_CONCURRENCY = getenv_positive_int("NOTEBOOK_KEEPALIVE_MAX_CONCURRENCY", 2)
 NOTEBOOK_KEEPALIVE_TIMEOUT_SEC = getenv_positive_int("NOTEBOOK_KEEPALIVE_TIMEOUT_SEC", 20)
+NOTEBOOK_AUTH_RESUME_WAIT_SEC = getenv_positive_int("NOTEBOOK_AUTH_RESUME_WAIT_SEC", 600)
+NOTEBOOK_AUTH_RESUME_POLL_SEC = getenv_positive_int("NOTEBOOK_AUTH_RESUME_POLL_SEC", 5)
 
 
 def validate_notebook_source_capacity(
@@ -224,9 +236,9 @@ def decode_notebook_auth_header_value(raw_value: str) -> Dict[str, Any]:
         if name and value:
             cookies[name] = value
 
-    if not any(name in cookies for name in ("SID", "__Secure-1PSID", "__Secure-3PSID")):
+    if "SID" not in cookies:
         raise ValueError(
-            f"{NOTEBOOK_AUTH_HEADER} no incluye SID ni __Secure-1PSID/__Secure-3PSID."
+            f"{NOTEBOOK_AUTH_HEADER} no incluye SID."
         )
 
     return {
@@ -291,6 +303,19 @@ class CP6BDocumentResponse(BaseModel):
     upload_status: str
 
 
+class FailedCompressedDownloadResponse(BaseModel):
+    index: int = 0
+    nombre_archivo: str = ""
+    texto_link: str = ""
+    categoria: str = ""
+    url: str = ""
+    url_origen: str = ""
+    extension: str = ""
+    formato: str = ""
+    tamano_bytes: int = 0
+    error: str = ""
+
+
 class CreateCP6BResponse(BaseModel):
     status: str
     run_id: str
@@ -298,6 +323,7 @@ class CreateCP6BResponse(BaseModel):
     id_documento: str
     documents_found: int
     documents: List[CP6BDocumentResponse]
+    failed_compressed_downloads: List[FailedCompressedDownloadResponse] = Field(default_factory=list)
 
 
 class CP6BStatusResponse(CreateCP6BResponse):
@@ -562,7 +588,7 @@ def _notebook_credentials_status_payload(
     normalized_status = str(row.get("status") or "").strip() or "unknown"
     return NotebookCredentialsStatusResponse(
         has_credentials=True,
-        valid=normalized_status in ("valid", "needs_validation"),
+        valid=normalized_status == "valid",
         status=normalized_status,
         validated_at=_row_timestamp_to_iso(row.get("validated_at")),
         last_checked_at=_row_timestamp_to_iso(row.get("last_checked_at")),
@@ -656,6 +682,51 @@ def _stored_notebook_credentials_user_id(notebook_auth: Optional[Dict[str, Any]]
     return str(notebook_auth.get("_credentials_user_id") or "").strip()
 
 
+def _attach_stored_notebook_credentials_ref(
+    metadata: Dict[str, Any],
+    notebook_auth: Optional[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """Guarda solo referencia al dueno de credenciales; nunca cookies."""
+    next_metadata = dict(metadata)
+    user_id = _stored_notebook_credentials_user_id(notebook_auth)
+    if user_id:
+        next_metadata[NOTEBOOK_CREDENTIALS_USER_ID_METADATA_KEY] = user_id
+    return next_metadata
+
+
+def _require_worker_compatible_notebook_auth(
+    notebook_auth: Optional[Dict[str, Any]],
+) -> None:
+    if RUN_JOBS_IN_WEB or _is_stored_notebook_credentials_payload(notebook_auth):
+        return
+    raise HTTPException(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        detail=(
+            "La carga asincrona por worker requiere credenciales NotebookLM guardadas "
+            "para el usuario. Sincroniza la extension antes de encolar."
+        ),
+    )
+
+
+def load_stored_notebook_auth_for_worker(
+    client: Client,
+    user_id: str,
+) -> Dict[str, Any]:
+    """Carga credenciales NotebookLM persistidas para que el worker ejecute la subida."""
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id:
+        raise RuntimeError("La corrida no tiene usuario de credenciales NotebookLM asociado.")
+    row = load_credentials(client, normalized_user_id)
+    if not row:
+        raise RuntimeError("No hay credenciales NotebookLM guardadas para esta corrida.")
+    if str(row.get("status") or "").strip() != "valid":
+        raise NotebookCredentialsExpired(
+            "Las credenciales NotebookLM guardadas no estan validas. "
+            "Sincroniza la extension e intenta nuevamente."
+        )
+    return _decode_stored_notebook_auth_payload(row, normalized_user_id)
+
+
 def _touch_stored_notebook_credentials(notebook_auth: Optional[Dict[str, Any]]) -> None:
     user_id = _stored_notebook_credentials_user_id(notebook_auth)
     if not user_id:
@@ -718,6 +789,77 @@ def _mark_stored_notebook_credentials_failure(
         print(f"[notebook-auth] No se pudo actualizar estado de credenciales para {user_id}: {mark_exc}")
 
 
+def _credentials_row_timestamp(row: Dict[str, Any]) -> Optional[datetime]:
+    """Retorna la marca temporal mas reciente de una fila de credenciales."""
+    timestamps = [
+        parse_timestamp(row.get("updated_at")),
+        parse_timestamp(row.get("last_checked_at")),
+        parse_timestamp(row.get("validated_at")),
+    ]
+    timestamps = [value for value in timestamps if value is not None]
+    return max(timestamps) if timestamps else None
+
+
+def _decode_stored_notebook_auth_payload(row: Dict[str, Any], user_id: str) -> Dict[str, Any]:
+    """Decifra una fila de credenciales y le agrega metadata no sensible de origen."""
+    payload = decrypt_payload(str(row.get("payload_enc") or ""))
+    if not isinstance(payload, dict):
+        raise ValueError("Las credenciales NotebookLM guardadas tienen un formato invalido.")
+    payload = dict(payload)
+    payload["_credentials_source"] = "stored"
+    payload["_credentials_user_id"] = user_id
+    return payload
+
+
+def _wait_for_refreshed_notebook_auth(
+    client: Client,
+    user_id: str,
+    *,
+    after: Optional[datetime],
+    wait_sec: Optional[int] = None,
+    poll_sec: Optional[int] = None,
+) -> Optional[tuple[Dict[str, Any], Dict[str, Any]]]:
+    """Espera a que la extension guarde credenciales validas mas nuevas.
+
+    Devuelve (notebook_auth, auth_seed) ya prevalidado para reanudar una carga.
+    """
+    normalized_user_id = str(user_id or "").strip()
+    if not normalized_user_id:
+        return None
+
+    max_wait = NOTEBOOK_AUTH_RESUME_WAIT_SEC if wait_sec is None else max(0, int(wait_sec))
+    poll_every = NOTEBOOK_AUTH_RESUME_POLL_SEC if poll_sec is None else max(1, int(poll_sec))
+    deadline = time.monotonic() + max_wait
+    last_seen_key = ""
+
+    while True:
+        try:
+            row = load_credentials(client, normalized_user_id)
+        except Exception as exc:  # noqa: BLE001
+            print(f"[notebook-auth] Error leyendo credenciales durante espera: {exc}")
+            row = None
+
+        if row and str(row.get("status") or "").strip() == "valid":
+            row_ts = _credentials_row_timestamp(row)
+            is_fresh = after is None or row_ts is None or row_ts > after
+            row_key = f"{row.get('status')}|{row.get('updated_at')}|{row.get('last_checked_at')}"
+            if is_fresh and row_key != last_seen_key:
+                last_seen_key = row_key
+                try:
+                    payload = _decode_stored_notebook_auth_payload(row, normalized_user_id)
+                    auth_seed = prepare_notebook_client_seed(payload)
+                    return payload, auth_seed
+                except Exception as exc:  # noqa: BLE001
+                    print(
+                        "[notebook-auth] Credenciales frescas aun no pasan preflight: "
+                        f"{exc}"
+                    )
+
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(min(poll_every, max(0.1, deadline - time.monotonic())))
+
+
 def require_bearer_token(authorization: Optional[str] = Header(default=None)) -> None:
     """Valida Authorization bearer token."""
     if not API_BEARER_TOKEN:
@@ -769,9 +911,9 @@ def get_notebook_auth_payload(
 
         if credentials_row:
             status_value = str(credentials_row.get("status") or "").strip()
-            if status_value in ("valid", "needs_validation"):
+            if status_value == "valid":
                 try:
-                    payload = decrypt_payload(str(credentials_row.get("payload_enc") or ""))
+                    return _decode_stored_notebook_auth_payload(credentials_row, user_id)
                 except ValueError as exc:
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
@@ -782,17 +924,6 @@ def get_notebook_auth_payload(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail=f"No se pudo abrir el almacenamiento cifrado de NotebookLM: {exc}",
                     ) from exc
-
-                if not isinstance(payload, dict):
-                    raise HTTPException(
-                        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                        detail="Las credenciales NotebookLM guardadas tienen un formato invalido.",
-                    )
-
-                payload = dict(payload)
-                payload["_credentials_source"] = "stored"
-                payload["_credentials_user_id"] = user_id
-                return payload
 
     if has_explicit_auth:
         try:
@@ -995,13 +1126,25 @@ def _normalize_storage_state_from_text(raw_text: str) -> tuple[Dict[str, Any], s
 
 REQUIRED_AUTH_COOKIE_GROUPS: tuple[frozenset[str], ...] = (
     frozenset({"SID"}),
-    frozenset({"__Secure-1PSID"}),
-    frozenset({"__Secure-3PSID"}),
 )
 
+EXTRA_NOTEBOOK_AUTH_COOKIE_DOMAINS: frozenset[str] = frozenset(
+    {
+        "google.com",
+        "www.google.com",
+        "accounts.google.com",
+        "myaccount.google.com",
+        ".notebooklm.google.com",
+    }
+)
+
+
 def _is_allowed_auth_domain_extended(domain: str) -> bool:
-    """Acepta los dominios admitidos por la lib (mantenido para hooks futuros)."""
-    return _is_allowed_auth_domain(domain)
+    """Acepta dominios de auth de Google reportados por Chrome y exports Netscape."""
+    normalized_domain = (domain or "").strip().lower()
+    return normalized_domain in EXTRA_NOTEBOOK_AUTH_COOKIE_DOMAINS or _is_allowed_auth_domain(
+        normalized_domain
+    )
 
 
 def _select_auth_cookies_from_storage(
@@ -1207,6 +1350,35 @@ def public_document_from_row(row: Dict[str, Any], tipo: str = "") -> CP6BDocumen
     )
 
 
+def failed_compressed_downloads_from_run(run: Dict[str, Any]) -> List[FailedCompressedDownloadResponse]:
+    """Retorna comprimidos fallidos guardados en trace_stats para mostrar en frontend."""
+    trace_stats = run.get("trace_stats")
+    if not isinstance(trace_stats, dict):
+        return []
+    raw_items = trace_stats.get("failed_compressed_downloads")
+    if not isinstance(raw_items, list):
+        return []
+
+    items: List[FailedCompressedDownloadResponse] = []
+    for raw in raw_items:
+        if not isinstance(raw, dict):
+            continue
+        url = str(raw.get("url") or raw.get("url_origen") or "")
+        items.append(FailedCompressedDownloadResponse(
+            index=to_int(raw.get("index")),
+            nombre_archivo=str(raw.get("nombre_archivo") or raw.get("texto_link") or ""),
+            texto_link=str(raw.get("texto_link") or raw.get("nombre_archivo") or ""),
+            categoria=str(raw.get("categoria") or ""),
+            url=url,
+            url_origen=str(raw.get("url_origen") or url),
+            extension=str(raw.get("extension") or ""),
+            formato=str(raw.get("formato") or ""),
+            tamano_bytes=to_int(raw.get("tamano_bytes")),
+            error=str(raw.get("error") or ""),
+        ))
+    return items
+
+
 def create_cp6b_run_record(
     client: Client,
     run_id: str,
@@ -1275,19 +1447,40 @@ def persist_cp6b_run_result(
         client.table("adenda_document_files").delete().eq("run_id", run_id).execute()
         client.table("adenda_document_files").insert(file_payloads).execute()
 
+    result_status = str(result.get("status") or "listed")
+    run_status = result_status if result_status in {"listed", "listed_with_warnings"} else "listed"
+    trace_stats = json_safe(result.get("trace_stats") or {})
+    failed_compressed_downloads = json_safe(
+        result.get("failed_compressed_downloads")
+        or (
+            trace_stats.get("failed_compressed_downloads", [])
+            if isinstance(trace_stats, dict)
+            else []
+        )
+    )
+    if not isinstance(failed_compressed_downloads, list):
+        failed_compressed_downloads = []
+    if isinstance(trace_stats, dict):
+        trace_stats["failed_compressed_downloads"] = failed_compressed_downloads
+        trace_stats["failed_compressed_downloads_count"] = len(failed_compressed_downloads)
+    warning_message = ""
+    if isinstance(trace_stats, dict):
+        warning_message = str(trace_stats.get("listing_warning_message") or "")
+    progress_message = warning_message or "Listado CP6B generado."
+
     client.table("adenda_document_runs").update({
-        "status": "listed",
+        "status": run_status,
         "metadata": json_safe(result.get("metadata") or {}),
         "docs_report_stats": json_safe(result.get("docs_report_stats") or {}),
-        "trace_stats": json_safe(result.get("trace_stats") or {}),
+        "trace_stats": trace_stats,
         "listado_excel_path": result.get("excel_path"),
         "trace_excel_path": result.get("trace_excel_path"),
         "progress_stage": "listed",
         "progress_current": len(file_payloads),
         "progress_total": max(1, len(file_payloads)),
         "progress_percent": 100 if file_payloads else 0,
-        "progress_message": "Listado CP6B generado.",
-        "error_message": "",
+        "progress_message": progress_message,
+        "error_message": warning_message[:2000],
     }).eq("id", run_id).execute()
     return documents
 
@@ -1334,11 +1527,13 @@ def queue_notebook_upload_selection(
     selected_ids: List[str],
     notebook_name: str,
     existing_notebook_id: Optional[str],
+    notebook_auth: Optional[Dict[str, Any]] = None,
 ) -> None:
     """Marca la seleccion para carga y deja la corrida lista para background upload."""
     run = load_run(client, run_id)
     metadata = run_metadata_dict(run)
     metadata["retry_upload_attempts"] = 0
+    metadata = _attach_stored_notebook_credentials_ref(metadata, notebook_auth)
     client.table("adenda_document_files").update({
         "seleccionar": False,
         "selected": False,
@@ -1393,6 +1588,66 @@ def retryable_document_ids(rows: List[Dict[str, Any]]) -> List[str]:
         if status_value in RETRYABLE_UPLOAD_STATUSES:
             ids.append(str(row.get("id") or ""))
     return [doc_id for doc_id in ids if doc_id]
+
+
+def unique_document_ids(values: List[Any]) -> List[str]:
+    """Normaliza ids preservando orden y eliminando duplicados."""
+    seen: set[str] = set()
+    unique_ids: List[str] = []
+    for value in values:
+        normalized = str(value or "").strip()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        unique_ids.append(normalized)
+    return unique_ids
+
+
+def selected_upload_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Filtra filas seleccionadas para el universo global de carga."""
+    return [
+        row
+        for row in rows
+        if bool(row.get("selected", row.get("seleccionar", False)))
+    ]
+
+
+def notebook_upload_progress_counts(
+    rows: List[Dict[str, Any]],
+    *,
+    fallback_total: int = 0,
+) -> tuple[int, int]:
+    """Calcula progreso global acumulado: completados terminales / seleccionados."""
+    selected_rows = selected_upload_rows(rows)
+    total = len(selected_rows) or max(0, fallback_total)
+    completed = sum(
+        1
+        for row in selected_rows
+        if str(row.get("upload_status") or "").strip().lower() in {"uploaded", "failed"}
+    )
+    return max(1, total), max(0, min(completed, max(1, total)))
+
+
+def notebook_upload_final_summary(
+    rows: List[Dict[str, Any]],
+    *,
+    fallback_total: int = 0,
+) -> Dict[str, int | str]:
+    """Resume estado final global de la carga seleccionada."""
+    selected_rows = selected_upload_rows(rows)
+    total = len(selected_rows) or max(0, fallback_total)
+    uploaded = sum(
+        1
+        for row in selected_rows
+        if str(row.get("upload_status") or "").strip().lower() == "uploaded"
+    )
+    retryable = len(retryable_document_ids(selected_rows))
+    return {
+        "total": max(1, total),
+        "uploaded": uploaded,
+        "retryable": retryable,
+        "status": "success" if retryable == 0 else "partial_success",
+    }
 
 
 def get_run_retry_attempts(run: Dict[str, Any]) -> int:
@@ -1625,6 +1880,15 @@ def build_zip_entry_filename_from_row(
         str(row.get("texto_link") or ""),
         stem_source,
     ]
+    parts = [normalize_zip_name_part(part) for part in raw_parts]
+    parts = [part for part in parts if part]
+    if not parts:
+        return sanitize_zip_entry_filename(fallback_name, f"documento_{index}{extension}")
+
+    file_name = f"{'_'.join(parts)}{extension.lower()}"
+    if len(file_name) <= ZIP_ENTRY_FILENAME_MAX_CHARS:
+        return compact_zip_entry_filename(file_name)
+
     parts = [
         truncate_zip_name_part(part, ZIP_ENTRY_PART_LIMITS[min(part_index, len(ZIP_ENTRY_PART_LIMITS) - 1)])
         for part_index, part in enumerate(raw_parts)
@@ -1732,6 +1996,7 @@ def build_retry_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -
     seen_arc_names: set[str] = set()
     included_count = 0
     missing_entries: List[str] = []
+    run_tipo = str(run.get("tipo") or "").strip()
 
     # Los PDFs/ZIP ya vienen comprimidos, asi que usar ZIP_STORED acelera mucho la exportacion.
     with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_STORED) as zip_file:
@@ -1745,23 +2010,21 @@ def build_retry_documents_zip(run: Dict[str, Any], rows: List[Dict[str, Any]]) -
                 missing_entries.append(f"- {fallback_name}: no se encontro el archivo fisico.")
                 continue
 
-            relative_parts = [
-                part.strip()
-                for part in PurePosixPath(ruta_relativa.replace("\\", "/")).parts
-                if part not in {"", ".", ".."}
-            ]
-            if not relative_parts:
-                relative_parts = [fallback_name]
-
-            base_arc_name = PurePosixPath("documentos_fallidos", *relative_parts).as_posix()
+            archive_file_name = build_zip_entry_filename_from_row(
+                row,
+                tipo=run_tipo,
+                fallback_name=fallback_name,
+                index=index,
+            )
+            base_arc_name = PurePosixPath("documentos_fallidos", archive_file_name).as_posix()
             arc_name = base_arc_name
             suffix = 2
             while arc_name in seen_arc_names:
                 arc_path = PurePosixPath(base_arc_name)
-                stem = arc_path.stem or "documento"
-                extension = arc_path.suffix
                 parent = arc_path.parent
-                arc_name = parent.joinpath(f"{stem}_{suffix}{extension}").as_posix()
+                arc_name = parent.joinpath(
+                    zip_entry_filename_with_suffix(arc_path.name, suffix)
+                ).as_posix()
                 suffix += 1
 
             seen_arc_names.add(arc_name)
@@ -1960,6 +2223,15 @@ def process_notebook_upload_background(
             raise RuntimeError("La corrida CP6B no tiene tipo/id_documento validos.")
 
         all_selected_rows = load_selected_documents(client, run_id, selected_ids)
+        try:
+            global_selected_rows = selected_upload_rows(load_run_documents(client, run_id))
+        except Exception as count_exc:  # noqa: BLE001
+            print(f"[notebook-upload] No se pudo leer progreso global de {run_id}: {count_exc}")
+            global_selected_rows = all_selected_rows
+        global_total_docs, global_completed_base = notebook_upload_progress_counts(
+            global_selected_rows,
+            fallback_total=len(selected_ids),
+        )
         already_uploaded_ids: List[str] = [
             str(row["id"]) for row in all_selected_rows
             if str(row.get("upload_status") or "").strip().lower() == "uploaded"
@@ -1974,7 +2246,7 @@ def process_notebook_upload_background(
                 f"[notebook-upload] Run {run_id}: {len(already_uploaded_ids)} doc(s) ya "
                 f"con upload_status=uploaded; se omiten."
             )
-        total_docs = max(1, len(selected_rows))
+        batch_total_docs = max(1, len(selected_rows))
         create_new_notebook = bool(nombre_notebook)
         notebook_name = normalize_optional_text(nombre_notebook) or str(
             run.get("nombre_notebooklm") or existing_notebook_id or ""
@@ -2008,8 +2280,8 @@ def process_notebook_upload_background(
         if create_new_notebook:
             update_run_progress(client, run_id, {
                 "stage": "creating_notebook",
-                "current": 0,
-                "total": total_docs,
+                "current": global_completed_base,
+                "total": global_total_docs,
                 "message": "Creando notebook en NotebookLM.",
             })
             notebook_id, notebook_title_used, notebook_error = notify_notebook_api(
@@ -2032,15 +2304,39 @@ def process_notebook_upload_background(
             "nombre_notebooklm": notebook_title_used,
             "status": "uploading",
             "progress_stage": "uploading",
-            "progress_current": 0,
-            "progress_total": total_docs,
-            "progress_percent": 0,
+            "progress_current": global_completed_base,
+            "progress_total": global_total_docs,
+            "progress_percent": max(0, min(100, int((global_completed_base / global_total_docs) * 100))),
             "progress_message": "Iniciando carga de documentos al notebook.",
             "error_message": "",
         }).eq("id", run_id).execute()
 
         def _progress(payload: Dict[str, Any]) -> None:
-            update_run_progress(client, run_id, payload)
+            batch_current = to_int(payload.get("current"))
+            global_current = max(
+                0,
+                min(global_total_docs, global_completed_base + batch_current),
+            )
+            message = str(payload.get("message") or "")
+            if message.startswith(("Subidos ", "Fallo ")) and ": " in message:
+                prefix, suffix = message.split(": ", 1)
+                label = "Subidos" if prefix.startswith("Subidos ") else "Fallo"
+                message = f"{label} {global_current}/{global_total_docs}: {suffix}"
+            elif batch_current == 0 and global_completed_base > 0:
+                message = (
+                    f"Reanudando carga: {global_completed_base}/{global_total_docs} "
+                    f"ya procesados; {batch_total_docs} pendiente(s) en este lote."
+                )
+            update_run_progress(
+                client,
+                run_id,
+                {
+                    **payload,
+                    "current": global_current,
+                    "total": global_total_docs,
+                    "message": message,
+                },
+            )
 
         def _item_progress(event: str, item: Dict[str, Any], index: int, total: int) -> None:
             document_id = str(item.get("document_id") or "").strip()
@@ -2093,20 +2389,39 @@ def process_notebook_upload_background(
             ),
         )
 
+        attempted_document_ids = unique_document_ids([
+            *attempted_document_ids,
+            *[item.get("document_id") for item in upload_stats.get("items", [])],
+        ])
         not_uploaded_ids = mark_remaining_documents_for_retry(
             client=client,
             run_id=run_id,
             selected_ids=selected_ids,
-            attempted_document_ids=[item.get("document_id") for item in upload_stats.get("items", [])],
+            attempted_document_ids=attempted_document_ids,
             reason="Documento no fue intentado en esta corrida de carga; queda pendiente para reintento.",
         )
 
-        retryable_count = to_int(upload_stats.get("uploaded_failed")) + len(not_uploaded_ids)
-        final_status = "success" if retryable_count == 0 else "partial_success"
-        final_total = max(1, len(selected_rows))
-        final_ok = to_int(upload_stats.get("uploaded_ok"))
-        final_failed = retryable_count
-        final_percent = 100 if final_total > 0 else 0
+        try:
+            final_summary = notebook_upload_final_summary(
+                load_run_documents(client, run_id),
+                fallback_total=global_total_docs,
+            )
+        except Exception as summary_exc:  # noqa: BLE001
+            print(f"[notebook-upload] No se pudo recalcular resumen global de {run_id}: {summary_exc}")
+            retryable_count = to_int(upload_stats.get("uploaded_failed")) + len(not_uploaded_ids)
+            final_summary = {
+                "total": global_total_docs,
+                "uploaded": min(
+                    global_total_docs,
+                    global_completed_base + to_int(upload_stats.get("uploaded_ok")),
+                ),
+                "retryable": retryable_count,
+                "status": "success" if retryable_count == 0 else "partial_success",
+            }
+        final_status = str(final_summary["status"])
+        final_total = to_int(final_summary["total"])
+        final_ok = to_int(final_summary["uploaded"])
+        final_failed = to_int(final_summary["retryable"])
         final_message = (
             f"Carga finalizada: {final_ok} ok, {final_failed} con error."
             if final_failed
@@ -2119,7 +2434,7 @@ def process_notebook_upload_background(
             "progress_stage": final_status,
             "progress_current": final_total,
             "progress_total": final_total,
-            "progress_percent": final_percent,
+            "progress_percent": 100,
             "progress_message": final_message,
             "error_message": "" if final_failed == 0 else str(run.get("error_message") or ""),
         }).eq("id", run_id).execute()
@@ -2130,9 +2445,10 @@ def process_notebook_upload_background(
             (notebook_auth or {}).get("_credentials_user_id")
             if isinstance(notebook_auth, dict) else None
         )
+        expired_row = None
         if user_id:
             try:
-                mark_credentials_status(
+                expired_row = mark_credentials_status(
                     client,
                     str(user_id),
                     status="expired",
@@ -2147,13 +2463,67 @@ def process_notebook_upload_background(
                     f"[notebook-upload] No se pudo marcar status=expired para "
                     f"{user_id}: {mark_exc}"
                 )
-        mark_remaining_documents_for_retry(
+        pending_resume_ids = mark_remaining_documents_for_retry(
             client=client,
             run_id=run_id,
             selected_ids=selected_ids,
             attempted_document_ids=attempted_document_ids,
             reason=f"Re-autenticacion NotebookLM requerida: {message}",
         )
+        wait_after = (
+            _credentials_row_timestamp(expired_row)
+            if isinstance(expired_row, dict)
+            else datetime.now(timezone.utc)
+        )
+        resume_notebook_id = ""
+        try:
+            resume_run = load_run(client, run_id)
+            resume_notebook_id = str(
+                resume_run.get("notebooklm_id")
+                or locals().get("notebook_id")
+                or existing_notebook_id
+                or ""
+            ).strip()
+        except Exception:
+            resume_notebook_id = str(locals().get("notebook_id") or existing_notebook_id or "").strip()
+
+        if user_id and resume_notebook_id and pending_resume_ids and NOTEBOOK_AUTH_RESUME_WAIT_SEC > 0:
+            client.table("adenda_document_runs").update({
+                "status": "uploading",
+                "progress_stage": "auth_waiting",
+                "progress_message": (
+                    "Credenciales NotebookLM caducas. Esperando que la extension "
+                    "sincronice credenciales frescas para continuar automaticamente."
+                ),
+                "error_message": message[:2000],
+            }).eq("id", run_id).execute()
+            print(
+                f"[notebook-upload] Run {run_id}: esperando credenciales frescas "
+                f"hasta {NOTEBOOK_AUTH_RESUME_WAIT_SEC}s para reanudar."
+            )
+            refreshed_auth = _wait_for_refreshed_notebook_auth(
+                client,
+                str(user_id),
+                after=wait_after,
+            )
+            if refreshed_auth:
+                fresh_notebook_auth, _fresh_auth_seed = refreshed_auth
+                print(f"[notebook-upload] Run {run_id}: credenciales frescas recibidas; reanudando.")
+                client.table("adenda_document_runs").update({
+                    "status": "uploading",
+                    "progress_stage": "uploading",
+                    "progress_message": "Credenciales refrescadas. Reanudando carga pendiente.",
+                    "error_message": "",
+                }).eq("id", run_id).execute()
+                process_notebook_upload_background(
+                    run_id,
+                    pending_resume_ids,
+                    None,
+                    resume_notebook_id,
+                    fresh_notebook_auth,
+                )
+                return
+
         client.table("adenda_document_runs").update({
             "status": "auth_required",
             "progress_stage": "auth_required",
@@ -2255,31 +2625,22 @@ def store_notebook_credentials(
                 ),
             )
 
-        token_fetch_ok = False
-        token_fetch_error: str = ""
         try:
             asyncio.run(fetch_tokens(dict(auth_payload["cookies"])))
-            token_fetch_ok = True
         except Exception as fetch_exc:  # noqa: BLE001
             token_fetch_error = str(fetch_exc).strip() or fetch_exc.__class__.__name__
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail=f"Cookies no validas para NotebookLM: {token_fetch_error}",
+            ) from fetch_exc
 
         client = get_supabase_client()
         row = store_credentials(
             client,
             user_id,
             auth_payload,
-            status="valid" if token_fetch_ok else "needs_validation",
+            status="valid",
         )
-        if not token_fetch_ok:
-            row = mark_credentials_status(
-                client,
-                user_id,
-                status="needs_validation",
-                last_error=f"fetch_tokens fallo (cookies guardadas igual): {token_fetch_error}",
-                event_type="store_token_fetch_failed",
-                event_source="credentials_store",
-                event_ok=False,
-            ) or row
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -2410,6 +2771,11 @@ def remove_notebook_credentials(
 
 
 @app.get(
+    "/notebooks/",
+    include_in_schema=False,
+    dependencies=[Depends(require_bearer_token)],
+)
+@app.get(
     "/notebooks",
     dependencies=[Depends(require_bearer_token)],
 )
@@ -2471,14 +2837,15 @@ def create_adenda_cp6b_listing(
             detail=f"No se pudo crear la corrida CP6B: {e}",
         ) from e
 
-    background_tasks.add_task(
-        process_cp6b_listing_background,
-        run_id,
-        tipo,
-        normalized_url,
-        str(output_dir),
-        exclude_keywords,
-    )
+    if RUN_JOBS_IN_WEB:
+        background_tasks.add_task(
+            process_cp6b_listing_background,
+            run_id,
+            tipo,
+            normalized_url,
+            str(output_dir),
+            exclude_keywords,
+        )
 
     return CreateCP6BResponse(
         status="queued",
@@ -2523,6 +2890,15 @@ def create_adenda_notebook_from_selection(
                 "o notebook_id para reutilizar uno existente."
             ),
         )
+    if notebook_auth is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Faltan credenciales NotebookLM validas. Sincroniza la extension o valida "
+                "cookies frescas antes de crear, reutilizar o cargar notebooks."
+            ),
+        )
+    _require_worker_compatible_notebook_auth(notebook_auth)
 
     try:
         supabase = get_supabase_client()
@@ -2566,6 +2942,7 @@ def create_adenda_notebook_from_selection(
             selected_ids=selected_ids,
             notebook_name=notebook_name,
             existing_notebook_id=existing_notebook_id,
+            notebook_auth=notebook_auth,
         )
     except HTTPException:
         raise
@@ -2575,14 +2952,15 @@ def create_adenda_notebook_from_selection(
             detail=f"No se pudo encolar la carga al notebook: {e}",
         ) from e
 
-    background_tasks.add_task(
-        process_notebook_upload_background,
-        payload.run_id,
-        selected_ids,
-        nombre_notebook,
-        existing_notebook_id,
-        notebook_auth,
-    )
+    if RUN_JOBS_IN_WEB:
+        background_tasks.add_task(
+            process_notebook_upload_background,
+            payload.run_id,
+            selected_ids,
+            nombre_notebook,
+            existing_notebook_id,
+            notebook_auth,
+        )
 
     notebook_id = str(existing_notebook_id or "")
     notebook_title_used = notebook_name
@@ -2631,6 +3009,7 @@ def get_adenda_cp6b_status(run_id: str) -> CP6BStatusResponse:
         id_documento=str(run.get("id_documento") or ""),
         documents_found=len(documents),
         documents=documents,
+        failed_compressed_downloads=failed_compressed_downloads_from_run(run),
         progress_stage=str(run.get("progress_stage") or ""),
         progress_current=to_int(run.get("progress_current")),
         progress_total=to_int(run.get("progress_total")),
@@ -2841,15 +3220,25 @@ def download_selected_documents_zip_export_part(
 )
 def retry_failed_notebook_upload(
     payload: RetryUploadRequest,
+    background_tasks: BackgroundTasks,
     notebook_auth: Optional[Dict[str, Any]] = Depends(get_notebook_auth_payload),
 ) -> RetryUploadResponse:
-    """Reintenta subir al notebook documentos fallidos o no alcanzados ya seleccionados."""
+    """Encola en background el reintento de documentos fallidos o no alcanzados."""
+    if notebook_auth is None:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail=(
+                "Faltan credenciales NotebookLM validas. Sincroniza la extension o valida "
+                "cookies frescas antes de reintentar la carga."
+            ),
+        )
+    _require_worker_compatible_notebook_auth(notebook_auth)
+
     auth_seed = None
     try:
         supabase = get_supabase_client()
         run = load_run(supabase, payload.run_id)
-        if notebook_auth is not None:
-            auth_seed = prepare_notebook_client_seed(notebook_auth)
+        auth_seed = prepare_notebook_client_seed(notebook_auth)
     except HTTPException:
         raise
     except Exception as e:
@@ -2900,6 +3289,13 @@ def retry_failed_notebook_upload(
         run,
         get_run_retry_attempts(run) + 1,
     )
+    run["metadata"] = _attach_stored_notebook_credentials_ref(
+        run_metadata_dict(run),
+        notebook_auth,
+    )
+    supabase.table("adenda_document_runs").update({
+        "metadata": json_safe(run["metadata"]),
+    }).eq("id", payload.run_id).execute()
 
     docs_for_upload = []
     selected_documents = []
@@ -2920,60 +3316,49 @@ def retry_failed_notebook_upload(
         })
         selected_documents.append(public_document_from_row(enriched_row, tipo=run_tipo))
 
-    try:
-        for row in failed_rows:
-            update_document_upload_state(
-                supabase,
-                str(row["id"]),
-                "selected",
-                "",
-            )
-        upload_stats = upload_documents_batch_and_single(
-            notebook_id=notebook_id,
-            docs_report=docs_for_upload,
-            limit=None,
-            api_base_url=NOTEBOOK_API_BASE_URL,
-            notebook_auth=notebook_auth,
-            auth_seed=auth_seed,
+    retry_ids = [str(row["id"]) for row in failed_rows]
+    for row in failed_rows:
+        update_document_upload_state(
+            supabase,
+            str(row["id"]),
+            "selected",
+            "",
         )
-        not_uploaded_ids = mark_remaining_documents_for_retry(
-            client=supabase,
-            run_id=payload.run_id,
-            selected_ids=[str(row["id"]) for row in failed_rows],
-            attempted_document_ids=[item.get("document_id") for item in upload_stats.get("items", [])],
-            reason="Documento no fue intentado durante el reintento; queda pendiente para nueva carga.",
-        )
-        for item in upload_stats.get("items", []):
-            document_id = item.get("document_id")
-            if not document_id:
-                continue
-            supabase.table("adenda_document_files").update({
-                "upload_status": "uploaded" if item.get("uploaded") else "failed",
-                "upload_error": "" if item.get("uploaded") else str(item.get("error") or "")[:2000],
-            }).eq("id", document_id).execute()
-        _touch_stored_notebook_credentials(notebook_auth)
-    except Exception as e:
-        _mark_stored_notebook_credentials_failure(notebook_auth, e)
-        mark_remaining_documents_for_retry(
-            client=supabase,
-            run_id=payload.run_id,
-            selected_ids=[str(row["id"]) for row in failed_rows],
-            attempted_document_ids=[],
-            reason=f"Reintento interrumpido antes de completar la carga: {e}",
-        )
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Error reintentando carga de notebook: {e}",
-        ) from e
 
-    remaining_rows = load_run_documents(supabase, payload.run_id)
-    retry_ids = retryable_document_ids([row for row in remaining_rows if bool(row.get("selected"))])
-    retry_status = "success" if not retry_ids else "partial_success"
+    try:
+        total_docs, completed_docs = notebook_upload_progress_counts(
+            load_run_documents(supabase, payload.run_id),
+            fallback_total=len(failed_rows),
+        )
+    except Exception:  # noqa: BLE001
+        total_docs = max(1, len(failed_rows))
+        completed_docs = 0
+
+    supabase.table("adenda_document_runs").update({
+        "status": "uploading",
+        "progress_stage": "upload_queued",
+        "progress_current": completed_docs,
+        "progress_total": total_docs,
+        "progress_percent": max(0, min(100, int((completed_docs / total_docs) * 100))),
+        "progress_message": f"Reintento en cola: {len(failed_rows)} documento(s) pendiente(s).",
+        "error_message": "",
+    }).eq("id", payload.run_id).execute()
+
+    if RUN_JOBS_IN_WEB:
+        background_tasks.add_task(
+            process_notebook_upload_background,
+            payload.run_id,
+            retry_ids,
+            None,
+            notebook_id,
+            notebook_auth,
+        )
+
     return RetryUploadResponse(
-        status=retry_status,
+        status="uploading",
         run_id=payload.run_id,
         notebooklm_id=notebook_id,
-        documents_uploaded_ok=upload_stats["uploaded_ok"],
+        documents_uploaded_ok=0,
         documents_uploaded_failed=len(retry_ids),
         retry_attempts=retry_attempts,
         retry_documents_count=len(retry_ids),

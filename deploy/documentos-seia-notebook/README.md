@@ -18,6 +18,14 @@ Persistencia:
 /var/lib/documentos-seia-notebook/downloads/
 ```
 
+El stack corre dos contenedores sobre el mismo volumen:
+
+- `documentos-seia-api`: responde HTTP, consulta estado y sirve descargas.
+- `documentos-seia-worker`: procesa descargas/descompresion/cargas NotebookLM.
+
+Esto evita que el proceso web ejecute trabajos pesados, pero conserva acceso a
+los mismos archivos descargados.
+
 ## Preparacion de la VM
 
 ```bash
@@ -66,4 +74,32 @@ docker compose ps
 ```bash
 curl http://127.0.0.1:8020/health
 docker compose ps
+docker compose logs -f documentos-seia-worker
 ```
+
+## Descargas SEIA
+
+`SEIA_DOWNLOAD_MAX_WORKERS=2` permite descargar archivos de una misma corrida
+en paralelo acotado. En VM chica partir con `2`; subir a `3` solo si no aparecen
+429/503 de SEIA, cortes de descarga, CPU alta o presion de disco. El progreso se
+reporta por bytes cuando `SEIA_DOWNLOAD_ESTIMATE_SIZES_FOR_PROGRESS=1`, pero se
+persiste con throttle via `SEIA_DOWNLOAD_PROGRESS_MIN_INTERVAL_SEC=5` para no
+saturar Supabase con actualizaciones por chunk.
+
+## Piloto keepalive NotebookLM
+
+`NOTEBOOK_KEEPALIVE_ENABLED=true` queda habilitado en `.env.example` para
+piloto controlado. Monitorear `notebook_user_credentials_events` por eventos
+`keepalive` y `keepalive_rotation`; para rollback, volver a
+`NOTEBOOK_KEEPALIVE_ENABLED=false` y reiniciar el stack.
+
+## Nota para Render
+
+No separar en dos servicios Render usando disco local sin cambiar almacenamiento:
+el disco de un Web Service y el de un Background Worker no es compartido. Para
+Render hay dos caminos seguros:
+
+- Mantener un solo servicio y bajar carga (`MAX_CONCURRENT_JOBS=1`,
+  `NOTEBOOK_UPLOAD_MAX_WORKERS=1`).
+- Separar web/worker solo si los documentos se guardan en almacenamiento
+  compartido externo (por ejemplo Supabase Storage o S3), no en `/data/downloads`.

@@ -20,6 +20,7 @@ import os
 import random
 import re
 import sys
+import threading
 import time
 import unicodedata
 from collections import Counter
@@ -120,6 +121,39 @@ def _getenv_optional_positive_int(name: str, default: int | None) -> int | None:
     return parsed_value if parsed_value > 0 else None
 
 
+def _getenv_positive_float(name: str, default: float) -> float:
+    raw_value = os.getenv(name, str(default)).strip()
+    try:
+        parsed_value = float(raw_value)
+    except ValueError:
+        return default
+    return parsed_value if parsed_value > 0 else default
+
+
+DOWNLOAD_RETRY_ATTEMPTS = max(
+    1,
+    _getenv_non_negative_int("SEIA_DOWNLOAD_RETRY_ATTEMPTS", 8),
+)
+DOWNLOAD_RETRY_BASE_SEC = _getenv_positive_float("SEIA_DOWNLOAD_RETRY_BASE_SEC", 4.0)
+DOWNLOAD_CONNECT_TIMEOUT_SEC = _getenv_positive_float("SEIA_DOWNLOAD_CONNECT_TIMEOUT_SEC", 15.0)
+DOWNLOAD_READ_TIMEOUT_SEC = _getenv_positive_float("SEIA_DOWNLOAD_READ_TIMEOUT_SEC", 180.0)
+DOWNLOAD_TIMEOUT = (DOWNLOAD_CONNECT_TIMEOUT_SEC, DOWNLOAD_READ_TIMEOUT_SEC)
+DOWNLOAD_MAX_WORKERS = max(
+    1,
+    _getenv_non_negative_int("SEIA_DOWNLOAD_MAX_WORKERS", 1),
+)
+DOWNLOAD_FAILED_RETRY_PASSES = _getenv_non_negative_int(
+    "SEIA_DOWNLOAD_FAILED_RETRY_PASSES",
+    1,
+)
+DOWNLOAD_ESTIMATE_SIZES_FOR_PROGRESS = bool(
+    _getenv_non_negative_int("SEIA_DOWNLOAD_ESTIMATE_SIZES_FOR_PROGRESS", 1)
+)
+DOWNLOAD_PROGRESS_MIN_INTERVAL_SEC = _getenv_positive_float(
+    "SEIA_DOWNLOAD_PROGRESS_MIN_INTERVAL_SEC",
+    5.0,
+)
+
 NOTEBOOK_SOURCES_PER_NOTEBOOK = _getenv_non_negative_int(
     "NOTEBOOK_SOURCES_PER_NOTEBOOK",
     300,
@@ -134,10 +168,14 @@ NOTEBOOK_UPLOAD_MAX_WORKERS = max(
 )
 NOTEBOOK_UPLOAD_RETRY_ATTEMPTS = max(
     1,
-    int(os.getenv("NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", "5") or "5"),
+    int(os.getenv("NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", "3") or "3"),
 )
 NOTEBOOK_UPLOAD_RETRY_BASE_SEC = float(
     os.getenv("NOTEBOOK_UPLOAD_RETRY_BASE_SEC", "5") or "5"
+)
+NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN = max(
+    40,
+    int(os.getenv("NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN", "80") or "80"),
 )
 NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC = float(
     os.getenv("NOTEBOOK_UPLOAD_SUBMIT_JITTER_SEC", "0.6") or "0.6"
@@ -216,10 +254,25 @@ def shorten_with_hash(text, maxlen):
     return f"{text[:keep]}_{digest}"
 
 
+def shorten_with_hash_middle(text, maxlen):
+    """Recorta conservando inicio y cola, con hash corto para estabilidad."""
+    text = (text or "").strip()
+    if maxlen <= 0:
+        return ""
+    if len(text) <= maxlen:
+        return text
+    digest = hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()[:8]
+    budget = max(2, maxlen - len(digest) - 2)
+    head_keep = max(1, budget // 2)
+    tail_keep = max(1, budget - head_keep)
+    return f"{text[:head_keep]}_{text[-tail_keep:]}_{digest}"
+
+
 def compact_component(name, maxlen=80):
     """
     Normaliza y compacta un componente de path:
     - elimina acentos
+    - reemplaza puntos internos por guiones
     - colapsa espacios/guiones bajos
     - acorta con hash para estabilidad
     """
@@ -227,7 +280,10 @@ def compact_component(name, maxlen=80):
     base = unicodedata.normalize("NFKD", base)
     base = base.encode("ascii", "ignore").decode("ascii")
     base = re.sub(r"\s+", " ", base).strip()
+    base = base.replace(".", "-")
     base = re.sub(r"[ _]+", "_", base)
+    base = re.sub(r"-{2,}", "-", base)
+    base = base.strip("._-")
     if not base:
         base = "sin_nombre"
     return shorten_with_hash(base, maxlen=maxlen)
@@ -520,6 +576,9 @@ def _is_file_link(href):
     href_lower = href.lower().strip()
     if href_lower.startswith("javascript:") or href_lower.startswith("#") or href_lower.startswith("mailto:"):
         return False
+    parsed = urlparse(href)
+    if parsed.scheme and parsed.scheme.lower() not in {"http", "https"}:
+        return False
     # Verificar si contiene /archivos/ (patron SEIA)
     if "/archivos/" in href_lower:
         return True
@@ -556,6 +615,8 @@ def extract_download_links(soup, page_url):
             full_url = BASE_SEIA + href
         else:
             full_url = force_https(urljoin(page_url, href))
+        if urlparse(full_url).scheme.lower() not in {"http", "https"}:
+            continue
 
         # Deduplicar
         norm = normalize_url(full_url)
@@ -662,7 +723,125 @@ def _resolve_download_path(doc, output_dir):
     return filepath
 
 
-def download_file(session, doc, output_dir):
+class DownloadIncompleteError(Exception):
+    """Error retryable para descargas cortadas o con tamano inesperado."""
+
+
+def _parse_non_negative_int(value):
+    """Convierte cabeceras numericas HTTP a int, si son validas."""
+    if value is None:
+        return None
+    try:
+        parsed = int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed >= 0 else None
+
+
+def _parse_content_range_total(value):
+    """Extrae el tamano total desde Content-Range: bytes start-end/total."""
+    if not value:
+        return None
+    match = re.search(r"/(\d+|\*)\s*$", str(value).strip())
+    if not match or match.group(1) == "*":
+        return None
+    return _parse_non_negative_int(match.group(1))
+
+
+def _response_expected_download_size(response, doc, bytes_already_downloaded=0):
+    """
+    Determina el tamano final esperado.
+
+    Para respuestas 206 usa Content-Range. Para 200 usa Content-Length. Si
+    no hay cabecera confiable, usa la estimacion HEAD guardada en doc.
+    """
+    content_encoding = (response.headers.get("Content-Encoding") or "").strip().lower()
+    if content_encoding and content_encoding != "identity":
+        return None
+
+    content_range_total = _parse_content_range_total(response.headers.get("Content-Range"))
+    if content_range_total is not None:
+        return content_range_total
+
+    content_length = _parse_non_negative_int(response.headers.get("Content-Length"))
+    if content_length is not None:
+        if response.status_code == 206:
+            return bytes_already_downloaded + content_length
+        return content_length
+
+    return _parse_non_negative_int(doc.get("size_bytes"))
+
+
+def _download_temp_path(filepath):
+    """Ruta temporal no descubrible como comprimido/PDF final."""
+    return filepath.with_name(f".{filepath.name}.part")
+
+
+def _safe_unlink(filepath):
+    """Elimina un archivo si existe, tolerando paths largos."""
+    try:
+        os.remove(_long_path(filepath))
+    except FileNotFoundError:
+        return
+    except OSError:
+        try:
+            Path(filepath).unlink(missing_ok=True)
+        except OSError:
+            pass
+
+
+def _existing_file_is_complete(filepath, expected_size=None):
+    size = _safe_stat_size(filepath)
+    if size <= 0:
+        return False
+    if expected_size is None:
+        return True
+    return size == expected_size
+
+
+def _is_retryable_download_error(error):
+    if isinstance(error, requests.exceptions.HTTPError):
+        response = getattr(error, "response", None)
+        status_code = getattr(response, "status_code", None)
+        return status_code in {408, 425, 429, 500, 502, 503, 504}
+    if isinstance(
+        error,
+        (
+            requests.exceptions.InvalidSchema,
+            requests.exceptions.MissingSchema,
+            requests.exceptions.InvalidURL,
+        ),
+    ):
+        return False
+    return True
+
+
+def _download_retry_wait(attempt):
+    wait = DOWNLOAD_RETRY_BASE_SEC * (2 ** max(0, attempt - 1))
+    jitter = random.uniform(0, min(2.0, DOWNLOAD_RETRY_BASE_SEC))
+    return min(120.0, wait + jitter)
+
+
+def _format_download_error(error):
+    message = str(error) or error.__class__.__name__
+    if len(message) > 260:
+        message = message[:260] + "..."
+    return message
+
+
+def _stream_response_to_path(response, filepath, mode, *, bytes_already_downloaded=0, progress_callback=None):
+    downloaded = 0
+    with open(_long_path(filepath), mode) as f:
+        for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
+            if chunk:
+                downloaded += len(chunk)
+                f.write(chunk)
+                if progress_callback:
+                    progress_callback(bytes_already_downloaded + downloaded)
+    return downloaded
+
+
+def download_file(session, doc, output_dir, progress_callback=None):
     """
     Descarga un archivo individual.
     Retorna (path_descargado, error_o_None).
@@ -675,40 +854,339 @@ def download_file(session, doc, output_dir):
         filepath = _resolve_download_path(doc, output_dir)
         doc["download_path"] = str(filepath.relative_to(output_dir))
 
-        # Skip si ya existe (reanudable)
-        if filepath.exists() and filepath.stat().st_size > 0:
+        expected_from_head = _parse_non_negative_int(doc.get("size_bytes"))
+        if filepath.exists() and _existing_file_is_complete(filepath, expected_from_head):
             doc["status"] = "done"
-            doc["size_bytes"] = filepath.stat().st_size
+            doc["size_bytes"] = _safe_stat_size(filepath)
+            if progress_callback:
+                progress_callback(doc["size_bytes"], doc["size_bytes"], "completed")
             return (filepath, None)
 
         os.makedirs(_long_path(filepath.parent), exist_ok=True)
 
-        response = safe_request(session, "get", url, stream=True, timeout=60)
-        response.raise_for_status()
+        tmp_path = _download_temp_path(filepath)
+        last_error = None
 
-        # Si no tiene extension, intentar deducir de Content-Type
-        if not filepath.suffix or filepath.suffix == ".bin":
-            content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
-            ext = CONTENT_TYPE_EXT_MAP.get(content_type)
-            if ext and ext != ".bin":
-                filepath = filepath.with_suffix(ext)
-                doc["download_path"] = str(filepath.relative_to(output_dir))
+        for attempt in range(1, DOWNLOAD_RETRY_ATTEMPTS + 1):
+            response = None
+            try:
+                partial_size = _safe_stat_size(tmp_path)
+                if expected_from_head is not None and partial_size > expected_from_head:
+                    _safe_unlink(tmp_path)
+                    partial_size = 0
+                if progress_callback:
+                    progress_callback(partial_size, expected_from_head, "starting")
+                if expected_from_head is not None and partial_size == expected_from_head:
+                    os.replace(_long_path(tmp_path), _long_path(filepath))
+                    doc["size_bytes"] = expected_from_head
+                    doc["status"] = "done"
+                    if progress_callback:
+                        progress_callback(expected_from_head, expected_from_head, "completed")
+                    return (filepath, None)
 
-        downloaded = 0
-        with open(_long_path(filepath), "wb") as f:
-            for chunk in response.iter_content(chunk_size=CHUNK_SIZE):
-                if chunk:
-                    downloaded += len(chunk)
-                    f.write(chunk)
+                headers = {"Accept-Encoding": "identity"}
+                if partial_size > 0:
+                    headers["Range"] = f"bytes={partial_size}-"
 
-        doc["size_bytes"] = downloaded
-        doc["status"] = "done"
-        return (filepath, None)
+                response = safe_request(
+                    session,
+                    "get",
+                    url,
+                    stream=True,
+                    timeout=DOWNLOAD_TIMEOUT,
+                    allow_redirects=True,
+                    headers=headers,
+                )
+                response.raise_for_status()
+
+                if not filepath.suffix or filepath.suffix == ".bin":
+                    content_type = response.headers.get("Content-Type", "").split(";")[0].strip()
+                    ext = CONTENT_TYPE_EXT_MAP.get(content_type)
+                    if ext and ext != ".bin":
+                        filepath = filepath.with_suffix(ext)
+                        doc["download_path"] = str(filepath.relative_to(output_dir))
+                        tmp_path = _download_temp_path(filepath)
+                        os.makedirs(_long_path(filepath.parent), exist_ok=True)
+                        partial_size = _safe_stat_size(tmp_path)
+
+                append_mode = partial_size > 0 and response.status_code == 206
+                if partial_size > 0 and not append_mode:
+                    _safe_unlink(tmp_path)
+                    partial_size = 0
+                    if progress_callback:
+                        progress_callback(0, expected_from_head, "starting")
+
+                expected_size = _response_expected_download_size(
+                    response,
+                    doc,
+                    bytes_already_downloaded=partial_size if append_mode else 0,
+                )
+                if filepath.exists() and _existing_file_is_complete(filepath, expected_size):
+                    _safe_unlink(tmp_path)
+                    doc["size_bytes"] = _safe_stat_size(filepath)
+                    doc["status"] = "done"
+                    response.close()
+                    if progress_callback:
+                        progress_callback(doc["size_bytes"], expected_size, "completed")
+                    return (filepath, None)
+
+                bytes_written = _stream_response_to_path(
+                    response,
+                    tmp_path,
+                    "ab" if append_mode else "wb",
+                    bytes_already_downloaded=partial_size if append_mode else 0,
+                    progress_callback=(
+                        (lambda downloaded: progress_callback(downloaded, expected_size, "downloading"))
+                        if progress_callback else None
+                    ),
+                )
+                downloaded = (partial_size if append_mode else 0) + bytes_written
+
+                if expected_size is not None and downloaded != expected_size:
+                    if downloaded > expected_size:
+                        _safe_unlink(tmp_path)
+                    raise DownloadIncompleteError(
+                        f"descarga incompleta: {format_size(downloaded)} de {format_size(expected_size)}"
+                    )
+                if downloaded <= 0:
+                    raise DownloadIncompleteError("descarga vacia")
+
+                os.replace(_long_path(tmp_path), _long_path(filepath))
+                doc["size_bytes"] = downloaded
+                doc["status"] = "done"
+                response.close()
+                if progress_callback:
+                    progress_callback(downloaded, expected_size, "completed")
+                return (filepath, None)
+
+            except Exception as e:
+                last_error = e
+                if response is not None:
+                    response.close()
+                if not _is_retryable_download_error(e) or attempt >= DOWNLOAD_RETRY_ATTEMPTS:
+                    _safe_unlink(tmp_path)
+                    break
+                if progress_callback:
+                    progress_callback(_safe_stat_size(tmp_path), expected_from_head, "retrying")
+                wait = _download_retry_wait(attempt)
+                print(
+                    f"\n      Descarga incompleta. Reintento {attempt + 1}/"
+                    f"{DOWNLOAD_RETRY_ATTEMPTS} en {wait:.1f}s: "
+                    f"{console_safe(_format_download_error(e))}",
+                    flush=True,
+                )
+                time.sleep(wait)
+
+        doc["status"] = "error"
+        doc["error"] = _format_download_error(last_error)
+        return (None, doc["error"])
 
     except Exception as e:
         doc["status"] = "error"
         doc["error"] = str(e)
         return (None, str(e))
+
+
+def _estimate_missing_sizes_for_progress(documents, max_workers):
+    """Completa size_bytes con HEAD paralelo para que progreso por bytes sea estable."""
+    docs_missing_size = [
+        doc for doc in documents
+        if _parse_non_negative_int(doc.get("size_bytes")) is None
+    ]
+    if not DOWNLOAD_ESTIMATE_SIZES_FOR_PROGRESS or not docs_missing_size:
+        return
+
+    workers = max(1, min(max_workers, len(docs_missing_size)))
+
+    def _estimate(doc):
+        try:
+            size = estimate_file_size(create_session(), doc.get("url"))
+            if size is not None:
+                doc["size_bytes"] = size
+        except Exception:
+            return
+
+    if workers <= 1:
+        for doc in docs_missing_size:
+            _estimate(doc)
+        return
+
+    with cf.ThreadPoolExecutor(max_workers=workers) as executor:
+        list(executor.map(_estimate, docs_missing_size))
+
+
+class _DownloadProgressTracker:
+    """Acumula progreso por bytes de descargas concurrentes."""
+
+    def __init__(self, documents, progress_callback=None):
+        self.documents = documents
+        self.progress_callback = progress_callback
+        self.lock = threading.Lock()
+        self.downloaded_by_index = {}
+        self.expected_by_index = {
+            idx: _parse_non_negative_int(doc.get("size_bytes")) or 0
+            for idx, doc in enumerate(documents)
+        }
+        self.completed_docs = 0
+        self.done = 0
+        self.failed = 0
+        self.total_bytes_done = 0
+        self.last_emit_at = 0.0
+
+    def _totals_locked(self):
+        current = sum(max(0, value) for value in self.downloaded_by_index.values())
+        total = sum(max(0, value) for value in self.expected_by_index.values())
+        return current, max(total, current)
+
+    def item_callback(self, idx, doc):
+        def _callback(downloaded_bytes, expected_bytes=None, event="downloading"):
+            expected = _parse_non_negative_int(expected_bytes)
+            downloaded = max(0, _parse_non_negative_int(downloaded_bytes) or 0)
+            name = str(doc.get("name") or f"documento_{idx + 1}")
+            should_emit = event in {"completed", "retrying", "failed"}
+            with self.lock:
+                if expected is not None:
+                    self.expected_by_index[idx] = max(self.expected_by_index.get(idx, 0), expected)
+                self.downloaded_by_index[idx] = downloaded
+                now = time.monotonic()
+                if not should_emit:
+                    should_emit = (
+                        self.last_emit_at <= 0
+                        or now - self.last_emit_at >= DOWNLOAD_PROGRESS_MIN_INTERVAL_SEC
+                    )
+                if not should_emit:
+                    return
+                self.last_emit_at = now
+                current, total = self._totals_locked()
+                message = (
+                    f"Descargando {idx + 1}/{len(self.documents)}: {name} "
+                    f"({format_size(downloaded)}/{format_size(self.expected_by_index.get(idx, 0) or None)})"
+                )
+            emit_progress(
+                self.progress_callback,
+                stage="downloading",
+                current=current,
+                total=total,
+                message=message,
+                current_documents=self.completed_docs,
+                total_documents=len(self.documents),
+                event=event,
+            )
+
+        return _callback
+
+    def mark_finished(self, idx, doc, error):
+        actual_size = _parse_non_negative_int(doc.get("size_bytes")) or 0
+        with self.lock:
+            self.completed_docs += 1
+            if error:
+                self.failed += 1
+            else:
+                self.done += 1
+                self.total_bytes_done += actual_size
+                self.downloaded_by_index[idx] = actual_size
+                self.expected_by_index[idx] = max(self.expected_by_index.get(idx, 0), actual_size)
+            current, total = self._totals_locked()
+            status_word = "Fallo" if error else "Descarga"
+            name = str(doc.get("name") or f"documento_{idx + 1}")
+            message = f"{status_word} {self.completed_docs}/{len(self.documents)}: {name}"
+        emit_progress(
+            self.progress_callback,
+            stage="downloading",
+            current=current,
+            total=total,
+            message=message,
+            done=self.done,
+            failed=self.failed,
+            current_documents=self.completed_docs,
+            total_documents=len(self.documents),
+        )
+
+
+def _download_result_summary(documents):
+    done_count = sum(1 for d in documents if d.get("status") == "done")
+    failed_count = sum(1 for d in documents if d.get("status") == "error")
+    total_size = sum(
+        _parse_non_negative_int(d.get("size_bytes")) or 0
+        for d in documents
+        if d.get("status") == "done"
+    )
+    return done_count, failed_count, total_size
+
+
+def _retry_failed_downloads(documents, output_dir, progress_callback=None):
+    """Reintenta documentos fallidos en pasada serial con sesiones frescas."""
+    if DOWNLOAD_FAILED_RETRY_PASSES <= 0:
+        return
+
+    for retry_pass in range(1, DOWNLOAD_FAILED_RETRY_PASSES + 1):
+        failed_docs = [
+            (idx, doc)
+            for idx, doc in enumerate(documents)
+            if doc.get("status") == "error"
+        ]
+        if not failed_docs:
+            return
+
+        done_count, failed_count, total_bytes = _download_result_summary(documents)
+        message = (
+            f"Reintentando {len(failed_docs)} descarga(s) fallida(s) "
+            f"(pasada {retry_pass}/{DOWNLOAD_FAILED_RETRY_PASSES})."
+        )
+        print(f"  {message}")
+        emit_progress(
+            progress_callback,
+            stage="downloading",
+            current=total_bytes,
+            total=max(total_bytes, sum(
+                _parse_non_negative_int(d.get("size_bytes")) or 0
+                for d in documents
+            )),
+            message=message,
+            done=done_count,
+            failed=failed_count,
+            current_documents=done_count,
+            total_documents=len(documents),
+            event="retrying",
+        )
+
+        retry_docs = [doc for _, doc in failed_docs]
+        tracker = _DownloadProgressTracker(retry_docs, progress_callback)
+
+        for retry_idx, (original_idx, doc) in enumerate(failed_docs):
+            filename = str(doc.get("name") or f"documento_{original_idx + 1}")
+            printable_filename = filename[:52] + "..." if len(filename) > 55 else filename
+            previous_error = doc.get("error")
+            doc["previous_error"] = previous_error
+            doc["retry_passes"] = int(doc.get("retry_passes") or 0) + 1
+            doc["status"] = "pending"
+            doc.pop("error", None)
+
+            print(
+                f"  [retry {retry_idx + 1}/{len(failed_docs)} | original "
+                f"{original_idx + 1}/{len(documents)}] "
+                f"{console_safe(printable_filename)} ... ",
+                end="",
+                flush=True,
+            )
+            file_start = time.time()
+            retry_session = create_session()
+            try:
+                path, error = download_file(
+                    retry_session,
+                    doc,
+                    output_dir,
+                    progress_callback=tracker.item_callback(retry_idx, doc),
+                )
+            finally:
+                retry_session.close()
+            file_elapsed = time.time() - file_start
+
+            if error:
+                print(f"ERROR ({console_safe(error)})")
+            else:
+                print(f"OK [{format_duration(file_elapsed)}]")
+            tracker.mark_finished(retry_idx, doc, error)
 
 
 def download_all(session, documents, output_dir, progress_callback=None):
@@ -718,13 +1196,61 @@ def download_all(session, documents, output_dir, progress_callback=None):
     failed = 0
     total_bytes = 0
     start_time = time.time()
+    max_workers = max(1, min(DOWNLOAD_MAX_WORKERS, total or 1))
+    _estimate_missing_sizes_for_progress(documents, max_workers)
+    total_expected_bytes = sum(
+        _parse_non_negative_int(doc.get("size_bytes")) or 0
+        for doc in documents
+    )
     emit_progress(
         progress_callback,
         stage="downloading",
         current=0,
-        total=total,
+        total=total_expected_bytes or total,
         message="Iniciando descarga de documentos SEIA.",
+        current_documents=0,
+        total_documents=total,
     )
+
+    if total == 0:
+        return done, failed, total_bytes, 0.0
+
+    if max_workers > 1:
+        tracker = _DownloadProgressTracker(documents, progress_callback)
+        print(f"  Descarga paralela: {max_workers} worker(s)")
+
+        def _download_one(idx_doc):
+            idx, doc = idx_doc
+            local_session = create_session()
+            return idx, doc, *download_file(
+                local_session,
+                doc,
+                output_dir,
+                progress_callback=tracker.item_callback(idx, doc),
+            )
+
+        with cf.ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [
+                executor.submit(_download_one, item)
+                for item in enumerate(documents)
+            ]
+            for future in cf.as_completed(futures):
+                idx, doc, path, error = future.result()
+                tracker.mark_finished(idx, doc, error)
+                filename = doc["name"]
+                if len(filename) > 55:
+                    filename = filename[:52] + "..."
+                if error:
+                    print(f"  [{idx+1}/{total}] {console_safe(filename)} ... ERROR ({console_safe(error)})")
+                else:
+                    print(f"  [{idx+1}/{total}] {console_safe(filename)} ... OK")
+
+        _retry_failed_downloads(documents, output_dir, progress_callback)
+        elapsed = time.time() - start_time
+        done, failed, total_bytes = _download_result_summary(documents)
+        return done, failed, total_bytes, elapsed
+
+    tracker = _DownloadProgressTracker(documents, progress_callback)
 
     for i, doc in enumerate(documents):
         filename = doc["name"]
@@ -735,7 +1261,12 @@ def download_all(session, documents, output_dir, progress_callback=None):
         print(f"  [{i+1}/{total}] {console_safe(filename)} ({size_str}) ... ", end="", flush=True)
 
         file_start = time.time()
-        path, error = download_file(session, doc, output_dir)
+        path, error = download_file(
+            session,
+            doc,
+            output_dir,
+            progress_callback=tracker.item_callback(i, doc),
+        )
         file_elapsed = time.time() - file_start
 
         if error:
@@ -747,15 +1278,7 @@ def download_all(session, documents, output_dir, progress_callback=None):
             total_bytes += actual_size
             print(f"OK [{format_duration(file_elapsed)}]")
 
-        emit_progress(
-            progress_callback,
-            stage="downloading",
-            current=i + 1,
-            total=total,
-            message=f"Descarga {i + 1}/{total}: {filename}",
-            done=done,
-            failed=failed,
-        )
+        tracker.mark_finished(i, doc, error)
 
         # Progreso parcial cada 10 archivos
         if (i + 1) % 10 == 0 and i + 1 < total:
@@ -764,7 +1287,9 @@ def download_all(session, documents, output_dir, progress_callback=None):
                   f"{format_size(total_bytes)} descargados | "
                   f"Tiempo: {format_duration(elapsed)}")
 
+    _retry_failed_downloads(documents, output_dir, progress_callback)
     elapsed = time.time() - start_time
+    done, failed, total_bytes = _download_result_summary(documents)
     return done, failed, total_bytes, elapsed
 
 
@@ -1155,6 +1680,7 @@ FINAL_PDF_EXCLUDE_KEYWORDS = (
 WINDOWS_PATH_SOFT_LIMIT = 240
 MAX_SECTION_DIR_LEN = 40
 MAX_FILENAME_LEN = 100
+NOTEBOOK_UPLOAD_FILENAME_MAX_LEN = 140
 MAX_EXTRACT_DIR_LEN = 36
 MAX_EXTRACT_PASSES = 8
 GENERATED_LOCAL_FILENAMES = {
@@ -1163,6 +1689,48 @@ GENERATED_LOCAL_FILENAMES = {
     "listado_final_pdf.xlsx",
     "trazabilidad_descarga_descompresion.xlsx",
 }
+
+
+def _archive_extension_for_doc(doc):
+    """Retorna extension comprimida detectada para un documento fallido."""
+    ext = normalize_known_extension(doc.get("file_type") or "")
+    if not ext:
+        try:
+            ext = Path(urlparse(str(doc.get("url") or "")).path).suffix.lower()
+        except Exception:
+            ext = ""
+    return ext if ext in ARCHIVE_EXTENSIONS else ""
+
+
+def build_failed_compressed_downloads(documents):
+    """Lista comprimidos que no se pudieron descargar para exponerlos en la app."""
+    failed = []
+    for doc in documents or []:
+        if doc.get("status") != "error":
+            continue
+        ext = _archive_extension_for_doc(doc)
+        if not ext:
+            continue
+
+        url = str(doc.get("url") or "")
+        fallback_name = Path(urlparse(url).path).name if url else ""
+        name = clean_text(doc.get("name") or doc.get("texto_link") or fallback_name)
+        if not name:
+            name = f"documento_{len(failed) + 1}{ext}"
+
+        failed.append({
+            "index": _parse_non_negative_int(doc.get("index")) or len(failed) + 1,
+            "nombre_archivo": name,
+            "texto_link": clean_text(doc.get("texto_link") or name),
+            "categoria": clean_text(doc.get("categoria") or doc.get("section") or ""),
+            "url": url,
+            "url_origen": str(doc.get("url_origen") or url),
+            "extension": ext,
+            "formato": ext.lstrip("."),
+            "tamano_bytes": _parse_non_negative_int(doc.get("size_bytes")) or 0,
+            "error": str(doc.get("error") or ""),
+        })
+    return failed
 
 
 def _long_path(p):
@@ -1234,6 +1802,70 @@ def _find_unrar_tool():
     return None
 
 
+def _find_7z_tool():
+    """Busca un ejecutable 7-Zip compatible con extraccion por CLI."""
+    for tool_name in ("7z", "7zz", "7za"):
+        tool = shutil.which(tool_name)
+        if tool:
+            return tool
+    for p in [
+        r"C:\Program Files\7-Zip\7z.exe",
+        r"C:\Program Files (x86)\7-Zip\7z.exe",
+    ]:
+        if os.path.exists(p):
+            return p
+    return None
+
+
+def _find_unar_tool():
+    """Busca The Unarchiver (`unar`) como respaldo para RAR modernos."""
+    return shutil.which("unar")
+
+
+def _find_rar_extractors():
+    """Retorna extractores RAR disponibles en orden de preferencia."""
+    extractors = []
+    seven_zip_tool = _find_7z_tool()
+    if seven_zip_tool:
+        extractors.append(("7z", seven_zip_tool))
+    unar_tool = _find_unar_tool()
+    if unar_tool:
+        extractors.append(("unar", unar_tool))
+    unrar_tool = _find_unrar_tool()
+    if unrar_tool:
+        extractors.append(("unrar", unrar_tool))
+    return extractors
+
+
+def _rar_extract_command(kind, tool, start_archive, extract_dir):
+    """Construye comando de extraccion RAR para el extractor elegido."""
+    if kind == "7z":
+        return [tool, "x", "-y", f"-o{extract_dir}", str(start_archive)]
+    if kind == "unar":
+        return [
+            tool,
+            "-quiet",
+            "-force-overwrite",
+            "-output-directory",
+            str(extract_dir),
+            str(start_archive),
+        ]
+    return [tool, "x", "-o+", "-y", str(start_archive), str(extract_dir) + os.sep]
+
+
+def _format_rar_process_error(kind, result, partial_files):
+    """Resume un fallo del extractor sin aceptar salidas parciales."""
+    err = (result.stderr or "").strip() or (result.stdout or "").strip()
+    if len(err) > 300:
+        err = err[:300] + "..."
+    if not err:
+        err = "sin detalle"
+    partial_note = ""
+    if partial_files:
+        partial_note = f"; extraccion parcial descartada ({partial_files} archivo(s))"
+    return f"{kind} error (code {result.returncode}): {err}{partial_note}"
+
+
 def _robocopy_move(src, dst):
     """Mueve directorio usando robocopy (soporta paths largos en Windows)."""
     dst_str = str(Path(dst).resolve())
@@ -1264,12 +1896,14 @@ def _extract_rar_group_with_unrar(volume_items, start_source_name, extract_dir):
     """
     import tempfile
 
-    unrar_tool = _find_unrar_tool()
-    if not unrar_tool:
-        return (0, "UnRAR no encontrado. Instala WinRAR o agrega unrar al PATH.")
+    extractors = _find_rar_extractors()
+    if not extractors:
+        return (
+            0,
+            "Extractor RAR no encontrado. Instala 7-Zip, unar o UnRAR y agrega el ejecutable al PATH.",
+        )
 
     stage_dir = Path(tempfile.mkdtemp(prefix="seia_vol_"))
-    tmp_extract_dir = Path(tempfile.mkdtemp(prefix="seia_ext_"))
 
     try:
         for item in volume_items:
@@ -1281,42 +1915,47 @@ def _extract_rar_group_with_unrar(volume_items, start_source_name, extract_dir):
         if not start_archive.exists():
             return (0, f"Volumen inicial no encontrado: {start_source_name}")
 
-        result = subprocess.run(
-            [unrar_tool, "x", "-o+", "-y", str(start_archive), str(tmp_extract_dir) + os.sep],
-            capture_output=True, text=True, timeout=900
-        )
+        errors = []
+        for kind, tool in extractors:
+            tmp_extract_dir = Path(tempfile.mkdtemp(prefix="seia_ext_"))
+            try:
+                result = subprocess.run(
+                    _rar_extract_command(kind, tool, start_archive, tmp_extract_dir),
+                    capture_output=True, text=True, timeout=900
+                )
 
-        num_files = _count_files_in_dir(tmp_extract_dir)
-        if result.returncode != 0 and num_files == 0:
-            err = result.stderr.strip() or result.stdout.strip()
-            if len(err) > 300:
-                err = err[:300] + "..."
-            return (0, f"UnRAR error (code {result.returncode}): {err}")
+                num_files = _count_files_in_dir(tmp_extract_dir)
+                if result.returncode != 0:
+                    errors.append(_format_rar_process_error(kind, result, num_files))
+                    continue
 
-        if Path(extract_dir).exists():
-            shutil.rmtree(str(extract_dir), ignore_errors=True)
-        os.makedirs(str(extract_dir), exist_ok=True)
+                if Path(extract_dir).exists():
+                    shutil.rmtree(str(extract_dir), ignore_errors=True)
+                os.makedirs(str(extract_dir), exist_ok=True)
 
-        if sys.platform == "win32":
-            _robocopy_move(tmp_extract_dir, extract_dir)
-        else:
-            shutil.move(str(tmp_extract_dir), str(extract_dir))
+                if sys.platform == "win32":
+                    _robocopy_move(tmp_extract_dir, extract_dir)
+                else:
+                    shutil.move(str(tmp_extract_dir), str(extract_dir))
 
-        num_files = _count_files_in_dir(extract_dir)
-        return (num_files, None)
+                num_files = _count_files_in_dir(extract_dir)
+                return (num_files, None)
+            finally:
+                if tmp_extract_dir.exists():
+                    shutil.rmtree(tmp_extract_dir, ignore_errors=True)
+
+        return (0, " | ".join(errors) if errors else "No se pudo extraer el RAR.")
 
     except Exception as e:
         return (0, str(e))
     finally:
         if stage_dir.exists():
             shutil.rmtree(stage_dir, ignore_errors=True)
-        if tmp_extract_dir.exists():
-            shutil.rmtree(tmp_extract_dir, ignore_errors=True)
 
 
 def _extract_rar_with_unrar(archive_path, extract_dir):
     """
-    Extrae RAR usando UnRAR.exe via directorio temporal corto.
+    Extrae RAR usando 7-Zip/unar/UnRAR via directorio temporal corto.
     Evita el limite de 260 caracteres de Windows extrayendo a un path corto
     y usando robocopy para mover al destino final.
     """
@@ -1959,6 +2598,62 @@ def build_final_pdf_report_from_trace(trace_rows, exclude_keywords=FINAL_PDF_EXC
     return docs, stats
 
 
+def build_cp6b_listing_quality(
+    docs_report,
+    downloaded_failed=0,
+    extraction_failed=0,
+):
+    """Resume senales de listado parcial para no reportar OK silencioso."""
+    pdf_origin_other = 0
+    pdf_zero_bytes = 0
+
+    for item in docs_report or []:
+        if str(item.get("extension") or "").lower() != ".pdf":
+            continue
+        if str(item.get("origen") or "").lower() == "otro":
+            pdf_origin_other += 1
+        try:
+            size_bytes = int(item.get("tamano_bytes") or 0)
+        except (TypeError, ValueError):
+            size_bytes = 0
+        if size_bytes <= 0:
+            pdf_zero_bytes += 1
+
+    warning_flags = []
+    if downloaded_failed:
+        warning_flags.append("download_failed")
+    if extraction_failed:
+        warning_flags.append("extraction_failed")
+    if pdf_origin_other:
+        warning_flags.append("untracked_pdf_origin")
+    if pdf_zero_bytes:
+        warning_flags.append("zero_byte_pdf")
+
+    message_parts = []
+    if downloaded_failed:
+        message_parts.append(f"{downloaded_failed} descarga(s) fallida(s)")
+    if extraction_failed:
+        message_parts.append(f"{extraction_failed} extraccion(es) fallida(s)")
+    if pdf_origin_other:
+        message_parts.append(f"{pdf_origin_other} PDF sin origen de descarga/descompresion trazado")
+    if pdf_zero_bytes:
+        message_parts.append(f"{pdf_zero_bytes} PDF con 0 bytes")
+
+    warning_message = ""
+    if message_parts:
+        warning_message = "Listado generado con advertencias: " + "; ".join(message_parts) + "."
+
+    return {
+        "has_warnings": bool(warning_flags),
+        "warning_flags": warning_flags,
+        "warning_message": warning_message,
+        "downloaded_failed": int(downloaded_failed or 0),
+        "extraction_failed": int(extraction_failed or 0),
+        "pdf_origen_otro": pdf_origin_other,
+        "pdf_zero_bytes": pdf_zero_bytes,
+    }
+
+
 def build_semantic_final_filename(item, parent_dir):
     """Construye nombre final semantico para el PDF filtrado."""
     current_name = str(item.get("nombre_archivo") or "")
@@ -2024,7 +2719,44 @@ def build_notebook_upload_filename(item):
     normalized = re.sub(r"[ _]+", "_", normalized).strip("_-")
     if not normalized:
         normalized = "archivo"
+    max_stem_len = max(1, NOTEBOOK_UPLOAD_FILENAME_MAX_LEN - len(ext))
+    normalized = shorten_with_hash_middle(normalized, maxlen=max_stem_len)
     return normalized + ext
+
+
+def build_notebook_upload_staging_filename(upload_name, fallback_name="archivo.pdf"):
+    """Construye nombre fisico corto para el multipart inicial de NotebookLM."""
+    upload_name = str(upload_name or "")
+    fallback_name = str(fallback_name or "archivo.pdf")
+    ext = Path(upload_name).suffix.lower() or Path(fallback_name).suffix.lower() or ".pdf"
+    stem = Path(upload_name).stem or Path(fallback_name).stem or "archivo"
+    normalized = unicodedata.normalize("NFKD", stem)
+    normalized = normalized.encode("ascii", "ignore").decode("ascii")
+    for char in '<>:"/\\|?*':
+        normalized = normalized.replace(char, "_")
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    normalized = normalized.replace(".", "-")
+    normalized = re.sub(r"[ _]+", "_", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("._-")
+    if not normalized:
+        normalized = "archivo"
+    max_stem_len = max(1, NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN - len(ext))
+    return shorten_with_hash_middle(normalized, maxlen=max_stem_len) + ext
+
+
+def prepare_notebook_upload_staging_file(source_path, upload_name):
+    """
+    Copia el archivo a una ruta temporal corta para que NotebookLM reciba
+    un filename simple en el multipart inicial. El caller borra stage_dir.
+    """
+    import tempfile
+
+    source_path = Path(source_path)
+    staging_name = build_notebook_upload_staging_filename(upload_name, source_path.name)
+    stage_dir = Path(tempfile.mkdtemp(prefix="notebook_upload_"))
+    stage_path = stage_dir / staging_name
+    shutil.copy2(_long_path(source_path), _long_path(stage_path))
+    return stage_path, stage_dir
 
 
 def rename_final_pdf_documents(output_dir, docs):
@@ -2492,6 +3224,103 @@ def _notebooklm_error_message(exc):
     return f"Error NotebookLM: {exc}"
 
 
+def _is_source_id_registration_error(exc):
+    """Detecta el fallo donde NotebookLM crea fuente pero no retorna SOURCE_ID."""
+    if not isinstance(exc, SourceAddError):
+        return False
+    return "SOURCE_ID" in str(exc)
+
+
+def _source_attr(source, name, default=None):
+    if isinstance(source, dict):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+async def _list_source_ids(client, notebook_id):
+    try:
+        sources = await client.sources.list(notebook_id)
+    except Exception:  # noqa: BLE001
+        return set()
+    return {
+        str(_source_attr(source, "id") or "")
+        for source in sources
+        if _source_attr(source, "id")
+    }
+
+
+async def _find_registered_source_after_missing_id(
+    client,
+    notebook_id,
+    filename,
+    known_source_ids,
+):
+    """Busca fuente recien registrada cuando el RPC no devolvio SOURCE_ID."""
+    try:
+        sources = await client.sources.list(notebook_id)
+    except Exception:  # noqa: BLE001
+        return None
+
+    exact_new_matches = []
+    exact_matches = []
+    for source in sources:
+        source_id = str(_source_attr(source, "id") or "")
+        title = str(_source_attr(source, "title") or "")
+        if title != filename or not source_id:
+            continue
+        if source_id not in known_source_ids:
+            exact_new_matches.append(source)
+        exact_matches.append(source)
+
+    if exact_new_matches:
+        return exact_new_matches[0]
+    if exact_matches:
+        return exact_matches[0]
+    return None
+
+
+async def _recover_add_file_after_missing_source_id(
+    client,
+    notebook_id,
+    upload_path,
+    filename,
+    known_source_ids,
+):
+    """Continua upload usando source_id recuperado desde lista NotebookLM."""
+    source = await _find_registered_source_after_missing_id(
+        client,
+        notebook_id,
+        filename,
+        known_source_ids,
+    )
+    if source is None:
+        return None
+
+    source_id = str(_source_attr(source, "id") or "")
+    start_upload = getattr(client.sources, "_start_resumable_upload", None)
+    stream_upload = getattr(client.sources, "_upload_file_streaming", None)
+    wait_ready = getattr(client.sources, "wait_until_ready", None)
+    if not callable(start_upload) or not callable(stream_upload) or not callable(wait_ready):
+        return None
+
+    print(
+        "      SOURCE_ID recuperado desde lista NotebookLM; "
+        f"continuando upload de {console_safe(filename)}"
+    )
+    upload_url = await start_upload(
+        notebook_id,
+        filename,
+        Path(upload_path).stat().st_size,
+        source_id,
+    )
+    await stream_upload(upload_url, Path(upload_path))
+    return await wait_ready(
+        notebook_id,
+        source_id,
+        timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
+    )
+
+
 def _normalize_notebook_auth_payload(
     notebook_auth: Optional[Dict[str, Any]] = None,
 ) -> Optional[Dict[str, Any]]:
@@ -2701,6 +3530,8 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     upload_name = str(
         doc.get("nombre_archivo_notebook") or build_notebook_upload_filename(doc)
     )
+    upload_path = p
+    stage_dir = None
     base_item = {
         "_order": order,
         "document_id": doc.get("document_id"),
@@ -2718,6 +3549,15 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
         return {**base_item, "error": f"No existe archivo: {p}", "attempts": 0}
 
     current_seed = auth_seed
+    try:
+        upload_path, stage_dir = prepare_notebook_upload_staging_file(p, upload_name)
+        base_item["upload_staging_name"] = upload_path.name
+    except Exception as stage_exc:
+        return {
+            **base_item,
+            "error": f"No se pudo preparar copia temporal para NotebookLM: {stage_exc}",
+            "attempts": 0,
+        }
 
     async def _upload():
         async with await _create_notebook_client_async(
@@ -2725,13 +3565,32 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
             auth_seed=current_seed,
             timeout=NOTEBOOK_CLIENT_TIMEOUT_SEC,
         ) as client:
-            source = await client.sources.add_file(
-                notebook_id,
-                _long_path(p),
-                wait=True,
-                wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
-            )
+            staging_filename = Path(upload_path).name
             warning = None
+            known_source_ids = await _list_source_ids(client, notebook_id)
+            try:
+                source = await client.sources.add_file(
+                    notebook_id,
+                    _long_path(upload_path),
+                    wait=True,
+                    wait_timeout=NOTEBOOK_UPLOAD_WAIT_TIMEOUT_SEC,
+                )
+            except SourceAddError as add_exc:
+                if not _is_source_id_registration_error(add_exc):
+                    raise
+                source = await _recover_add_file_after_missing_source_id(
+                    client,
+                    notebook_id,
+                    upload_path,
+                    staging_filename,
+                    known_source_ids,
+                )
+                if source is None:
+                    raise
+                warning = (
+                    "NotebookLM registro la fuente sin devolver SOURCE_ID; "
+                    "se recupero desde la lista de fuentes."
+                )
             if upload_name and source.title != upload_name:
                 try:
                     source = await client.sources.rename(
@@ -2740,10 +3599,11 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
                         upload_name,
                     )
                 except Exception as rename_exc:
-                    warning = (
+                    rename_warning = (
                         f"Source subido pero no se pudo renombrar a "
                         f"'{upload_name}': {_notebooklm_error_message(rename_exc)}"
                     )
+                    warning = f"{warning} {rename_warning}" if warning else rename_warning
             baseline_cookies = (current_seed or {}).get("cookies") or {}
             rotated_cookies = _extract_rotated_cookies(client, baseline_cookies)
         return source, warning, rotated_cookies
@@ -2762,64 +3622,68 @@ def _upload_single_document(notebook_id, doc, order, notebook_auth=None, auth_se
     started = time.perf_counter()
     last_error = None
     attempts_done = 0
-    for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
-        attempts_done = attempt
-        try:
-            source, warning, rotated_cookies = asyncio.run(_upload())
-            elapsed = time.perf_counter() - started
-            return {
-                **base_item,
-                "status_code": 200,
-                "uploaded": True,
-                "error": None,
-                "warning": warning,
-                "response_body": {"ok": True, "item": _source_payload(source)},
-                "elapsed_seconds": round(elapsed, 2),
-                "attempts": attempts_done,
-                "rotated_cookies": rotated_cookies or {},
-            }
-        except (FileNotFoundError, ValidationError, AuthError) as e:
-            last_error = e
-            break
-        except httpx.HTTPStatusError as e:
-            last_error = e
-            status_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
-            if status_code != 429 and status_code < 500:
+    try:
+        for attempt in range(1, NOTEBOOK_UPLOAD_RETRY_ATTEMPTS + 1):
+            attempts_done = attempt
+            try:
+                source, warning, rotated_cookies = asyncio.run(_upload())
+                elapsed = time.perf_counter() - started
+                return {
+                    **base_item,
+                    "status_code": 200,
+                    "uploaded": True,
+                    "error": None,
+                    "warning": warning,
+                    "response_body": {"ok": True, "item": _source_payload(source)},
+                    "elapsed_seconds": round(elapsed, 2),
+                    "attempts": attempts_done,
+                    "rotated_cookies": rotated_cookies or {},
+                }
+            except (FileNotFoundError, ValidationError, AuthError) as e:
+                last_error = e
                 break
-        except (
-            SourceAddError,
-            SourceTimeoutError,
-            SourceProcessingError,
-            httpx.TimeoutException,
-            httpx.TransportError,
-        ) as e:
-            last_error = e
-        except Exception as e:
-            last_error = e
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                status_code = getattr(getattr(e, "response", None), "status_code", 0) or 0
+                if status_code != 429 and status_code < 500:
+                    break
+            except (
+                SourceAddError,
+                SourceTimeoutError,
+                SourceProcessingError,
+                httpx.TimeoutException,
+                httpx.TransportError,
+            ) as e:
+                last_error = e
+            except Exception as e:
+                last_error = e
 
-        if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
-            refresh_note = ""
-            if isinstance(last_error, SourceAddError) or "SOURCE_ID" in str(last_error):
-                _verbose_diag_dump_source_error(upload_name, last_error, current_seed, attempt)
-                try:
-                    refreshed = asyncio.run(_refresh_tokens())
-                    if refreshed:
-                        current_seed = refreshed
-                        refresh_note = " [tokens refrescados]"
-                except ValueError as refresh_exc:
-                    raise NotebookCredentialsExpired(
-                        f"Cookies NotebookLM caducas durante refresh: {refresh_exc}"
-                    ) from refresh_exc
-                except Exception as refresh_exc:
-                    refresh_note = f" [refresh tokens fallo: {type(refresh_exc).__name__}]"
-            sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
-            sleep_s += random.uniform(0, 0.5)
-            print(
-                f"      Reintento {attempt}/{NOTEBOOK_UPLOAD_RETRY_ATTEMPTS - 1} "
-                f"de {console_safe(upload_name)} en {round(sleep_s, 2)}s "
-                f"(motivo: {type(last_error).__name__}){refresh_note}"
-            )
-            time.sleep(sleep_s)
+            if attempt < NOTEBOOK_UPLOAD_RETRY_ATTEMPTS:
+                refresh_note = ""
+                if isinstance(last_error, SourceAddError) or "SOURCE_ID" in str(last_error):
+                    _verbose_diag_dump_source_error(upload_name, last_error, current_seed, attempt)
+                    try:
+                        refreshed = asyncio.run(_refresh_tokens())
+                        if refreshed:
+                            current_seed = refreshed
+                            refresh_note = " [tokens refrescados]"
+                    except ValueError as refresh_exc:
+                        raise NotebookCredentialsExpired(
+                            f"Cookies NotebookLM caducas durante refresh: {refresh_exc}"
+                        ) from refresh_exc
+                    except Exception as refresh_exc:
+                        refresh_note = f" [refresh tokens fallo: {type(refresh_exc).__name__}]"
+                sleep_s = NOTEBOOK_UPLOAD_RETRY_BASE_SEC * (2 ** (attempt - 1))
+                sleep_s += random.uniform(0, 0.5)
+                print(
+                    f"      Reintento {attempt}/{NOTEBOOK_UPLOAD_RETRY_ATTEMPTS - 1} "
+                    f"de {console_safe(upload_name)} en {round(sleep_s, 2)}s "
+                    f"(motivo: {type(last_error).__name__}){refresh_note}"
+                )
+                time.sleep(sleep_s)
+    finally:
+        if stage_dir is not None:
+            shutil.rmtree(stage_dir, ignore_errors=True)
 
     elapsed = time.perf_counter() - started
     error_msg = _notebooklm_error_message(last_error) if last_error else "Error desconocido"
@@ -3345,10 +4209,33 @@ def run_seia_notebook_pipeline(
     if tipo_value:
         for item in docs_report:
             item["tipo"] = tipo_value
+    listing_quality = build_cp6b_listing_quality(
+        docs_report,
+        downloaded_failed=failed,
+        extraction_failed=ext_fail,
+    )
+    failed_compressed_downloads = build_failed_compressed_downloads(documents)
+    trace_stats = dict(trace_stats or {})
+    trace_stats.update({
+        "downloaded_ok": done,
+        "downloaded_failed": failed,
+        "extraction_ok": ext_ok,
+        "extraction_failed": ext_fail,
+        "extracted_files": ext_files,
+        "listing_warning_flags": listing_quality["warning_flags"],
+        "listing_warning_message": listing_quality["warning_message"],
+        "pdf_origen_otro": listing_quality["pdf_origen_otro"],
+        "pdf_zero_bytes": listing_quality["pdf_zero_bytes"],
+        "failed_compressed_downloads": failed_compressed_downloads,
+        "failed_compressed_downloads_count": len(failed_compressed_downloads),
+    })
     renamed_final_docs = rename_final_pdf_documents(output_dir, docs_report)
     print_final_pdf_report(docs_report, docs_report_stats)
     if renamed_final_docs:
         print(f"  Renombrados finales aplicados: {renamed_final_docs}")
+    if listing_quality["has_warnings"]:
+        print(f"  ADVERTENCIA: {listing_quality['warning_message']}")
+    listing_status = "listed_with_warnings" if listing_quality["has_warnings"] else "listed"
 
     excel_path, excel_error = export_final_pdf_report_excel(docs_report, output_dir)
     print()
@@ -3381,7 +4268,7 @@ def run_seia_notebook_pipeline(
         print()
         print("Listo.")
         return {
-            "status": "listed",
+            "status": listing_status,
             "id_adenda": id_adenda,
             "tipo": tipo,
             "id_documento": id_doc,
@@ -3405,6 +4292,8 @@ def run_seia_notebook_pipeline(
             "docs_report": docs_report,
             "docs_report_stats": docs_report_stats,
             "trace_stats": trace_stats,
+            "failed_compressed_downloads": failed_compressed_downloads,
+            "listing_quality": listing_quality,
             "upload_items": [],
         }
 
@@ -3463,6 +4352,8 @@ def run_seia_notebook_pipeline(
 
     total_elapsed = time.time() - global_start
     pipeline_status = "success" if upload_stats["uploaded_failed"] == 0 else "partial_success"
+    if listing_quality["has_warnings"] and pipeline_status == "success":
+        pipeline_status = "partial_success"
 
     print()
     print("Listo.")
@@ -3499,6 +4390,8 @@ def run_seia_notebook_pipeline(
         "docs_report": docs_report,
         "docs_report_stats": docs_report_stats,
         "trace_stats": trace_stats,
+        "failed_compressed_downloads": failed_compressed_downloads,
+        "listing_quality": listing_quality,
         "upload_items": upload_stats.get("items", []),
     }
 

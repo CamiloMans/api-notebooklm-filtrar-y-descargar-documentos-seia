@@ -18,8 +18,11 @@ servidor en sintonia con el browser.
   `{"cookies": [...]}`).
 - Envia con headers `Authorization: Bearer <API_BEARER_TOKEN>` y
   `X-Myma-User-JWT: <Supabase access_token>`.
-- Repite cada N minutos via `chrome.alarms` (default 10 min, configurable
+- Repite cada N minutos via `chrome.alarms` (default 2 min, configurable
   1-60).
+- Cuando Chrome tiene mas de un cookie store/perfil activo, valida cada store
+  por separado y persiste el `storeId` que autentica correctamente para evitar
+  mezclar cookies de cuentas distintas.
 
 El backend valida con `fetch_tokens` y persiste cifrado via
 `store_credentials`, asi que cada sync rota tambien el `__Secure-1PSIDTS`
@@ -50,7 +53,7 @@ fresco.
      hora. Para sacarlo: en `apps/web` logueado, DevTools → Application →
      Local Storage → key `sb-<ref>-auth-token` → field `refresh_token`. O en
      consola: `(await window.supabase.auth.getSession()).data.session.refresh_token`.
-   - **Intervalo (min)** — default 10. Bajar a 5 si quieres mas frecuencia.
+   - **Intervalo (min)** — default 2. Subirlo si quieres menos frecuencia.
 4. Click **Guardar**.
 5. Click **Permitir host backend** y aceptar el prompt de Chrome (para que la
    extension pueda hacer `fetch` hacia el backend).
@@ -87,8 +90,8 @@ que copiar bearer/URL/refresh_token al popup.
 
 **Extension ID estable:** `klgfnedjofnmlcfkndbehjhpbbahdnhc`
 
-(El ID es fijo gracias al campo `key` en `manifest.json`. No cambia entre
-instalaciones del mismo unpacked.)
+El ID es fijo gracias al campo `key` en `manifest.json`. No cambia entre
+instalaciones del mismo unpacked.
 
 **Origenes autorizados** (ver `externally_connectable.matches` y la
 allowlist en `background.js`):
@@ -117,7 +120,7 @@ async function configureNotebookExtension() {
           backendUrl: BACKEND_URL,
           bearerToken: API_BEARER_TOKEN,
           refreshToken: session.refresh_token,
-          intervalMin: 10,
+          intervalMin: 2,
         },
       },
       (resp) => {
@@ -154,7 +157,13 @@ async function syncNotebookExtension() {
   cambia el refresh_token.
 - `{type: 'sync_now'}` → ejecuta sync inmediato.
 - `{type: 'get_status'}` → devuelve estado seguro (sin valores de tokens, solo
-  banderas `hasBearer`/`hasRefreshToken` + lastSync/lastError).
+  banderas `hasBearer`/`hasRefreshToken` + lastSync/lastError +
+  `preferredStoreId`/diagnostico por store +
+  `needsConfigure`/`lastRefreshError` para refresh Supabase invalido).
+
+La version `0.2.9` requiere que el backend exponga `POST /auth/validate-cookies`.
+Si aparece `HTTP 404` en ese endpoint, la extension esta actualizada pero el
+backend/proxy desplegado no lo esta; actualizar el backend antes de reintentar.
 
 ### UX recomendada en apps/web
 

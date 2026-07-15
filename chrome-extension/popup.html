@@ -53,8 +53,9 @@
   <body>
     <h3>Myma NotebookLM Cookie Sync</h3>
     <div class="muted">
-      Lee cookies de Google del browser actual y las envia al backend Myma para mantener viva la sesion NotebookLM. Asegurate de tener sesion activa en
-      <code>accounts.google.com</code> con la cuenta correcta.
+      Lee cookies de NotebookLM y de la cuenta Google del perfil actual. Para autenticar en el backend se necesita
+      <code>SID</code> desde <code>.google.com</code>, no solo cookies de <code>notebooklm.google.com</code>.
+      Asegurate de usar el mismo perfil de Chrome donde NotebookLM funciona.
     </div>
 
     <label>Backend URL</label>
@@ -68,7 +69,7 @@
     <div class="muted">El backend cambia el refresh_token por un access_token fresco antes de cada sync.</div>
 
     <label>Intervalo de sync (min)</label>
-    <input id="intervalMin" type="number" min="1" max="60" value="10" />
+    <input id="intervalMin" type="number" min="1" max="60" value="2" />
 
     <div class="row">
       <button id="save">Guardar</button>
@@ -79,6 +80,7 @@
     <div class="ok" id="lastOk"></div>
     <div class="err" id="lastErr"></div>
     <div class="muted">Ultimo sync: <span id="lastSync">nunca</span></div>
+    <div class="resp" id="cookieSummary"></div>
     <div class="resp" id="lastResponse"></div>
 
     <hr style="margin-top:14px" />

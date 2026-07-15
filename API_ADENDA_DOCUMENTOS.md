@@ -34,6 +34,7 @@ Notas:
 - `exclude_keywords` es opcional.
 - Si `exclude_keywords` viene vacio, no se aplica filtro por palabras en CP6B.
 - La respuesta es asincrona y devuelve `202 Accepted`.
+- Si `RUN_JOBS_IN_WEB=false`, el web server solo encola y `worker_app.py` procesa la descarga.
 - `nombre_archivo_final` sigue siendo el nombre fisico local.
 - `nombre_archivo_notebook` y `nombre_para_notebook` representan el nombre descriptivo usado al subir a NotebookLM.
 - El mismo `run_id` se reutiliza luego para seguir el avance de la carga al notebook.
@@ -75,6 +76,20 @@ Response:
   "retry_attempts": 0,
   "retry_documents_count": 0,
   "retry_document_ids": [],
+  "failed_compressed_downloads": [
+    {
+      "index": 36,
+      "nombre_archivo": "Apendice 7-2 Topografia",
+      "texto_link": "Apendice 7-2 Topografia",
+      "categoria": "Anexos",
+      "url": "https://seia.sea.gob.cl/archivos/2026/05/22/Apendice_7_2_Topografia.rar",
+      "url_origen": "https://seia.sea.gob.cl/archivos/2026/05/22/Apendice_7_2_Topografia.rar",
+      "extension": ".rar",
+      "formato": "rar",
+      "tamano_bytes": 198366580,
+      "error": "descarga incompleta: 0 B de 189.2 MB"
+    }
+  ],
   "documents": [
     {
       "document_id": "uuid-documento",
@@ -148,7 +163,10 @@ Notas:
 - La respuesta ahora es asincrona y devuelve `202 Accepted`.
 - Para ver el avance de la carga debes seguir consultando `GET /api/v1/adenda/descarga-documentos-seia/{run_id}`.
 - Durante la carga, `progress_stage` avanza por `upload_queued`, `creating_notebook` y `uploading`.
+- Si `RUN_JOBS_IN_WEB=false`, la carga a NotebookLM queda en `upload_queued` hasta que el worker la tome.
+- En modo worker, la carga a NotebookLM requiere credenciales guardadas por usuario; no se pasan cookies crudas al proceso en cola.
 - Cuando termina la carga, el `GET` tambien devuelve `retry_attempts`, `retry_document_ids` y `retry_documents_count` con los documentos que fallaron o no alcanzaron a intentarse.
+- Si algun comprimido (`.rar`, `.zip`, `.7z`, `.kmz`) no se pudo descargar, el `GET` devuelve `failed_compressed_downloads` con nombre, URL y error para que el frontend muestre una descarga manual.
 - La API de NotebookLM actual expone una subida por archivo, asi que este proyecto acelera la carga usando varias subidas individuales en paralelo.
 - Por defecto se valida un maximo de `300` fuentes por notebook (`NOTEBOOK_SOURCES_PER_NOTEBOOK=300`) para cuentas NotebookLM Pro.
 - Si la cuenta usa Standard, Plus o Ultra, ajusta `NOTEBOOK_SOURCES_PER_NOTEBOOK` y, si corresponde, `NOTEBOOK_UPLOAD_LIMIT` en `.env`.
