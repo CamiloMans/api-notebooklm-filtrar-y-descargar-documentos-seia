@@ -1,0 +1,19 @@
+[Unit]
+Description=Documentos SEIA Notebook stack
+After=docker.service network-online.target
+Wants=network-online.target
+Requires=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+Environment=GCP_PROJECT_ID=myma-496119
+Environment=IMAGE_TAG=REPLACE_WITH_GIT_SHA
+Environment=DOCUMENTOS_SEIA_ROOT=/opt/documentos-seia-notebook
+ExecStart=/opt/documentos-seia-notebook/start_stack.sh
+ExecStop=/usr/bin/docker compose --project-directory /opt/documentos-seia-notebook -f /opt/documentos-seia-notebook/docker-compose.yml --profile worker down
+TimeoutStartSec=180
+TimeoutStopSec=960
+
+[Install]
+WantedBy=multi-user.target

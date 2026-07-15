@@ -2,11 +2,12 @@ name: documentos-seia-notebook
 
 services:
   documentos-seia-api:
+    image: documentos-seia-api:${IMAGE_TAG:-dev}
     build:
       context: ./repos/documentos-seia
       dockerfile: Dockerfile
     env_file:
-      - .env
+      - ${DOCUMENTOS_SEIA_ENV_FILE:-.env}
     environment:
       API_OUTPUT_ROOT: /data/downloads
       RUN_JOBS_IN_WEB: "false"
@@ -16,6 +17,11 @@ services:
       SEIA_DOWNLOAD_RETRY_BASE_SEC: "8"
       SEIA_DOWNLOAD_FAILED_RETRY_PASSES: "1"
     restart: unless-stopped
+    mem_limit: 512m
+    cpus: 0.50
+    pids_limit: 128
+    security_opt:
+      - no-new-privileges:true
     ports:
       - "127.0.0.1:8020:8000"
     volumes:
@@ -33,12 +39,11 @@ services:
         max-file: "5"
 
   documentos-seia-worker:
-    build:
-      context: ./repos/documentos-seia
-      dockerfile: Dockerfile
+    image: documentos-seia-api:${IMAGE_TAG:-dev}
     command: ["python", "worker_app.py"]
+    profiles: ["worker"]
     env_file:
-      - .env
+      - ${DOCUMENTOS_SEIA_ENV_FILE:-.env}
     environment:
       API_OUTPUT_ROOT: /data/downloads
       RUN_JOBS_IN_WEB: "false"
@@ -49,6 +54,12 @@ services:
       SEIA_DOWNLOAD_RETRY_BASE_SEC: "8"
       SEIA_DOWNLOAD_FAILED_RETRY_PASSES: "1"
     restart: unless-stopped
+    stop_grace_period: 15m
+    mem_limit: 768m
+    cpus: 1.0
+    pids_limit: 256
+    security_opt:
+      - no-new-privileges:true
     healthcheck:
       disable: true
     volumes:
