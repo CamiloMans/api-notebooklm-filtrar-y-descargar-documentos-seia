@@ -5,10 +5,12 @@ PROJECT_ID="${GCP_PROJECT_ID:-myma-496119}"
 TARGET="${DOCUMENTOS_SEIA_ENV_FILE:-/run/myma-secrets/documentos-seia.env}"
 TARGET_DIR="$(dirname "$TARGET")"
 TMP_FILE="$(mktemp)"
+export CLOUDSDK_CONFIG="${CLOUDSDK_CONFIG:-/run/gcloud-documentos-seia}"
 
 umask 077
 trap 'rm -f "$TMP_FILE"' EXIT
 install -d -m 700 "$TARGET_DIR"
+install -d -m 700 "$CLOUDSDK_CONFIG"
 
 secret() {
   gcloud secrets versions access latest --project "$PROJECT_ID" --secret "$1"

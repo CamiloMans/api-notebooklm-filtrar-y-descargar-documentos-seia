@@ -8,6 +8,7 @@ Requires=docker.service
 Type=oneshot
 RemainAfterExit=yes
 Environment=GCP_PROJECT_ID=myma-496119
+Environment=CLOUDSDK_CONFIG=/run/gcloud-documentos-seia
 Environment=IMAGE_TAG=REPLACE_WITH_GIT_SHA
 Environment=DOCUMENTOS_SEIA_ROOT=/opt/documentos-seia-notebook
 ExecStart=/opt/documentos-seia-notebook/start_stack.sh
