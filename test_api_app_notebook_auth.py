@@ -1834,5 +1834,750 @@ class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
             self.assertTrue(any(path.name == "final.pdf" for path in extract_dir.rglob("*.pdf")))
 
 
+class DownloadDocumentoSeiaDownloadTests(unittest.TestCase):
+    def _download_doc(self, size_bytes=10):
+        return {
+            "index": 1,
+            "name": "Anexo prueba.rar",
+            "url": "https://example.test/anexo.rar",
+            "section": "Documentos",
+            "file_type": ".rar",
+            "size_bytes": size_bytes,
+            "download_path": None,
+            "status": "pending",
+            "error": None,
+        }
+
+    def test_download_file_resumes_after_incomplete_stream(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            first_error = download_documento_seia.requests.exceptions.ChunkedEncodingError("corte")
+            responses = [
+                _FakeDownloadResponse([b"abc"], {"Content-Length": "10"}, error=first_error),
+                _FakeDownloadResponse(
+                    [b"defghij"],
+                    {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+                    status_code=206,
+                ),
+            ]
+
+            with patch.object(download_documento_seia, "safe_request", side_effect=responses) as safe_request, patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                2,
+            ), patch.object(download_documento_seia, "DOWNLOAD_RETRY_BASE_SEC", 0):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdefghij")
+            self.assertEqual(doc["status"], "done")
+            self.assertFalse(list(output_dir.rglob("*.part")))
+            self.assertEqual(
+                safe_request.call_args_list[1].kwargs["headers"]["Range"],
+                "bytes=3-",
+            )
+
+    def test_download_file_retries_short_response_without_exception(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            responses = [
+                _FakeDownloadResponse([b"abc"], {"Content-Length": "10"}),
+                _FakeDownloadResponse(
+                    [b"defghij"],
+                    {"Content-Range": "bytes 3-9/10", "Content-Length": "7"},
+                    status_code=206,
+                ),
+            ]
+
+            with patch.object(download_documento_seia, "safe_request", side_effect=responses), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                2,
+            ), patch.object(download_documento_seia, "DOWNLOAD_RETRY_BASE_SEC", 0):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(error)
+            self.assertEqual(path.read_bytes(), b"abcdefghij")
+            self.assertEqual(doc["size_bytes"], 10)
+
+    def test_download_file_removes_temp_after_final_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            response = _FakeDownloadResponse([b"abc"], {"Content-Length": "10"})
+
+            with patch.object(download_documento_seia, "safe_request", return_value=response), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                1,
+            ):
+                path, error = download_documento_seia.download_file(object(), doc, output_dir)
+
+            self.assertIsNone(path)
+            self.assertIn("descarga incompleta", error)
+            self.assertEqual(doc["status"], "error")
+            self.assertFalse(list(output_dir.rglob("*.part")))
+            self.assertFalse(list(output_dir.rglob("*.rar")))
+
+    def test_download_file_can_keep_temp_after_final_failure(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            response = _FakeDownloadResponse([b"abc"], {"Content-Length": "10"})
+
+            with patch.object(download_documento_seia, "safe_request", return_value=response), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_RETRY_ATTEMPTS",
+                1,
+            ):
+                path, error = download_documento_seia.download_file(
+                    object(),
+                    doc,
+                    output_dir,
+                    keep_partial_on_failure=True,
+                )
+
+            self.assertIsNone(path)
+            self.assertIn("descarga incompleta", error)
+            self.assertEqual(doc["status"], "error")
+            self.assertTrue(list(output_dir.rglob("*.part")))
+            self.assertFalse(list(output_dir.rglob("*.rar")))
+
+    def test_download_all_retries_failed_documents_until_complete(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            output_dir = Path(tmp_dir)
+            doc = self._download_doc(size_bytes=10)
+            attempts = []
+
+            def fake_download_file(_session, current_doc, _output_dir, keep_partial_on_failure=False):
+                attempts.append(keep_partial_on_failure)
+                if len(attempts) == 1:
+                    current_doc["status"] = "error"
+                    current_doc["error"] = "corte"
+                    return None, "corte"
+                current_doc["status"] = "done"
+                current_doc["error"] = None
+                current_doc["size_bytes"] = 10
+                return output_dir / "Anexo_prueba.rar", None
+
+            with patch.object(
+                download_documento_seia,
+                "download_file",
+                side_effect=fake_download_file,
+            ), patch.object(download_documento_seia, "time") as fake_time, patch.object(
+                download_documento_seia,
+                "REQUIRE_COMPLETE_DOWNLOADS",
+                True,
+            ), patch.object(download_documento_seia, "DOWNLOAD_FAILED_PASS_BASE_SEC", 0.01), patch.object(
+                download_documento_seia,
+                "DOWNLOAD_FAILED_PASS_MAX_SEC",
+                0.01,
+            ):
+                fake_time.time.side_effect = [0, 1, 2, 3, 4, 5]
+                done, failed, total_bytes, _elapsed = download_documento_seia.download_all(
+                    object(),
+                    [doc],
+                    output_dir,
+                )
+
+            self.assertEqual(done, 1)
+            self.assertEqual(failed, 0)
+            self.assertEqual(total_bytes, 10)
+            self.assertEqual(attempts, [True, True])
+
+
+class DownloadDocumentoSeiaNotebookUploadTests(unittest.TestCase):
+    def test_notebook_upload_filename_is_capped(self):
+        row = {
+            "tipo": "EIA",
+            "categoria": "Minera HMC S.A Rep. Legal Jose Miguel Ibanez Anrique",
+            "texto_link": "Anexo 3.2 PAS 136",
+            "nombre_archivo": (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+            ),
+            "ruta_relativa": "Anexo_3.2_PAS_136/EIA_Minera_HMC_S.A_Rep.pdf",
+        }
+
+        notebook_name = download_documento_seia.build_notebook_upload_filename(row)
+
+        self.assertTrue(notebook_name.endswith(".pdf"))
+        self.assertLessEqual(
+            len(notebook_name),
+            download_documento_seia.NOTEBOOK_UPLOAD_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", Path(notebook_name).stem)
+
+    def test_staging_filename_is_short_and_has_no_internal_dots(self):
+        name = (
+            "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+            "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+        )
+
+        staging_name = download_documento_seia.build_notebook_upload_staging_filename(name)
+
+        self.assertTrue(staging_name.endswith(".pdf"))
+        self.assertLessEqual(
+            len(staging_name),
+            download_documento_seia.NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", Path(staging_name).stem)
+
+    def test_upload_single_document_uses_short_staging_file_before_rename(self):
+        captured = {}
+
+        class FakeSources:
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["add_file_path"] = path_str
+                self_outer.assertTrue(Path(path_str).exists())
+                return SimpleNamespace(
+                    id="source-1",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        self_outer = self
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            long_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+            )
+            source_path = Path(tmp_dir) / long_name
+            source_path.write_bytes(b"%PDF-1.4\n")
+            upload_name = download_documento_seia.build_notebook_upload_filename(
+                {
+                    "tipo": "EIA",
+                    "categoria": "Minera HMC S.A Rep. Legal Jose Miguel Ibanez Anrique",
+                    "texto_link": "Anexo 3.2 PAS 136",
+                    "nombre_archivo": long_name,
+                    "nombre_archivo_final": long_name,
+                    "ruta_relativa": long_name,
+                }
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": long_name,
+                        "nombre_archivo": long_name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        add_file_path = Path(captured["add_file_path"])
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(captured["rename_title"], upload_name)
+        self.assertLessEqual(
+            len(add_file_path.name),
+            download_documento_seia.NOTEBOOK_UPLOAD_STAGING_FILENAME_MAX_LEN,
+        )
+        self.assertNotIn(".", add_file_path.stem)
+        self.assertFalse(add_file_path.exists())
+
+    def test_upload_single_document_recovers_source_id_from_created_source(self):
+        captured = {}
+
+        class FakeSources:
+            def __init__(self):
+                self.list_calls = 0
+
+            async def list(self, notebook_id):
+                self.list_calls += 1
+                if self.list_calls == 1:
+                    return []
+                staging_name = captured["staging_name"]
+                return [
+                    SimpleNamespace(
+                        id="source-recovered",
+                        title=staging_name,
+                        kind="PDF",
+                        status=3,
+                    )
+                ]
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["staging_name"] = Path(path_str).name
+                raise download_documento_seia.SourceAddError(
+                    captured["staging_name"],
+                    message="Failed to get SOURCE_ID from registration response",
+                )
+
+            async def _start_resumable_upload(self, notebook_id, filename, file_size, source_id):
+                captured["start_upload"] = {
+                    "filename": filename,
+                    "file_size": file_size,
+                    "source_id": source_id,
+                }
+                return "https://upload.example/session"
+
+            async def _upload_file_streaming(self, upload_url, file_path):
+                captured["upload_url"] = upload_url
+                captured["uploaded_path_exists"] = Path(file_path).exists()
+
+            async def wait_until_ready(self, notebook_id, source_id, timeout):
+                captured["wait"] = {"source_id": source_id, "timeout": timeout}
+                return SimpleNamespace(
+                    id=source_id,
+                    title=captured["staging_name"],
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "archivo_original.pdf"
+            source_path.write_bytes(b"%PDF-1.4\ncontent")
+            upload_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Modificacion_de_Proyecto_Modificacion_de_Proyecto.pdf"
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertIn("SOURCE_ID", result["warning"])
+        self.assertEqual(captured["start_upload"]["source_id"], "source-recovered")
+        self.assertEqual(captured["wait"]["source_id"], "source-recovered")
+        self.assertEqual(captured["rename_title"], upload_name)
+        self.assertTrue(captured["uploaded_path_exists"])
+
+    def test_upload_single_document_reuses_ready_duplicate_over_error_source(self):
+        captured = {}
+
+        class FakeSources:
+            async def list(self, notebook_id):
+                staging_name = captured.get("staging_name")
+                if not staging_name:
+                    return []
+                return [
+                    SimpleNamespace(
+                        id="source-error",
+                        title=staging_name,
+                        kind="PDF",
+                        status=3,
+                    ),
+                    SimpleNamespace(
+                        id="source-ready",
+                        title=staging_name,
+                        kind="PDF",
+                        status=2,
+                    ),
+                ]
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                captured["staging_name"] = Path(path_str).name
+                raise download_documento_seia.SourceAddError(
+                    captured["staging_name"],
+                    message="Failed to get SOURCE_ID from registration response",
+                )
+
+            async def _start_resumable_upload(self, notebook_id, filename, file_size, source_id):
+                captured["start_upload_called"] = True
+                return "https://upload.example/session"
+
+            async def _upload_file_streaming(self, upload_url, file_path):
+                captured["stream_called"] = True
+
+            async def wait_until_ready(self, notebook_id, source_id, timeout):
+                captured["wait_source_id"] = source_id
+                return SimpleNamespace(
+                    id=source_id,
+                    title=captured["staging_name"],
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_source_id"] = source_id
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "estabilidad.pdf"
+            source_path.write_bytes(b"%PDF-1.4\ncontent")
+            upload_name = (
+                "EIA_Minera_HMC_S.A_Rep._Legal_Jose_Miguel_Ibanez_Anrique_"
+                "Anexo_3.2_PAS_136_Apendice_3.2-1_Estabilidad_Fisica.pdf"
+            )
+
+            with patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+        )
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(captured["rename_source_id"], "source-ready")
+        self.assertNotIn("wait_source_id", captured)
+        self.assertFalse(captured.get("start_upload_called", False))
+        self.assertFalse(captured.get("stream_called", False))
+
+    def test_upload_single_document_rewrites_pdf_after_source_id_failure(self):
+        captured = {"payloads": []}
+
+        class FakeSources:
+            async def list(self, notebook_id):
+                return []
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                payload = Path(path_str).read_bytes()
+                captured["payloads"].append(payload)
+                if payload != b"rewritten-pdf":
+                    raise download_documento_seia.SourceAddError(
+                        Path(path_str).name,
+                        message="Failed to get SOURCE_ID from registration response",
+                    )
+                return SimpleNamespace(
+                    id="source-rewritten",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        def fake_rewrite(source_path, output_path):
+            Path(output_path).write_bytes(b"rewritten-pdf")
+            return Path(output_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "estabilidad.pdf"
+            source_path.write_bytes(b"original-pdf")
+            upload_name = "EIA_Estabilidad_Fisica.pdf"
+
+            with patch.object(download_documento_seia, "NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", 1), patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ), patch.object(
+                download_documento_seia,
+                "_rewrite_pdf_for_notebook",
+                side_effect=fake_rewrite,
+            ), patch.object(
+                download_documento_seia,
+                "_flatten_ocr_pdf_for_notebook",
+            ) as fake_ocr:
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["upload_variant"], "reescrito")
+        self.assertEqual(result["upload_total_attempts"], 2)
+        self.assertIn(b"original-pdf", captured["payloads"])
+        self.assertIn(b"rewritten-pdf", captured["payloads"])
+        self.assertFalse(fake_ocr.called)
+        self.assertEqual(result["response_body"]["item"]["title"], upload_name)
+
+    def test_upload_single_document_ocr_pdf_after_rewrite_upload_failure(self):
+        captured = {"payloads": []}
+
+        class FakeSources:
+            async def list(self, notebook_id):
+                return []
+
+            async def add_file(self, notebook_id, path, wait, wait_timeout):
+                path_str = str(path)
+                if path_str.startswith("\\\\?\\"):
+                    path_str = path_str[4:]
+                payload = Path(path_str).read_bytes()
+                captured["payloads"].append(payload)
+                if payload != b"ocr-pdf":
+                    raise download_documento_seia.SourceAddError(
+                        Path(path_str).name,
+                        message="Failed to get SOURCE_ID from registration response",
+                    )
+                return SimpleNamespace(
+                    id="source-ocr",
+                    title=Path(path_str).name,
+                    kind="PDF",
+                    status=2,
+                )
+
+            async def rename(self, notebook_id, source_id, title):
+                captured["rename_title"] = title
+                return SimpleNamespace(id=source_id, title=title, kind="PDF", status=2)
+
+        class FakeClient:
+            def __init__(self):
+                self.sources = FakeSources()
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        async def fake_create_client(**_kwargs):
+            return FakeClient()
+
+        def fake_rewrite(source_path, output_path):
+            Path(output_path).write_bytes(b"rewritten-pdf")
+            return Path(output_path)
+
+        def fake_ocr(source_path, output_path):
+            Path(output_path).write_bytes(b"ocr-pdf")
+            return Path(output_path)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            source_path = Path(tmp_dir) / "estabilidad.pdf"
+            source_path.write_bytes(b"original-pdf")
+            upload_name = "EIA_Estabilidad_Fisica.pdf"
+
+            with patch.object(download_documento_seia, "NOTEBOOK_UPLOAD_RETRY_ATTEMPTS", 1), patch.object(
+                download_documento_seia,
+                "_create_notebook_client_async",
+                side_effect=fake_create_client,
+            ), patch.object(
+                download_documento_seia,
+                "_rewrite_pdf_for_notebook",
+                side_effect=fake_rewrite,
+            ), patch.object(
+                download_documento_seia,
+                "_flatten_ocr_pdf_for_notebook",
+                side_effect=fake_ocr,
+            ), patch.object(download_documento_seia, "NOTEBOOK_PDF_OCR_ENABLED", True):
+                result = download_documento_seia._upload_single_document(
+                    "notebook-1",
+                    {
+                        "document_id": "doc-1",
+                        "ruta_absoluta": str(source_path),
+                        "ruta_relativa": source_path.name,
+                        "nombre_archivo": source_path.name,
+                        "nombre_archivo_notebook": upload_name,
+                    },
+                    1,
+                    notebook_auth={"cookies": {"SID": "sid"}},
+                )
+
+        self.assertTrue(result["uploaded"])
+        self.assertEqual(result["upload_variant"], "aplanado+OCR")
+        self.assertEqual(result["upload_total_attempts"], 3)
+        self.assertEqual(
+            captured["payloads"],
+            [b"original-pdf", b"rewritten-pdf", b"ocr-pdf"],
+        )
+        self.assertEqual(result["response_body"]["item"]["title"], upload_name)
+
+
+class DownloadDocumentoSeiaArchiveTests(unittest.TestCase):
+    def test_rar_extractors_prefer_7z_then_unar_then_unrar(self):
+        with patch.object(download_documento_seia, "_find_7z_tool", return_value="/usr/bin/7z"), patch.object(
+            download_documento_seia,
+            "_find_unar_tool",
+            return_value="/usr/bin/unar",
+        ), patch.object(
+            download_documento_seia,
+            "_find_unrar_tool",
+            return_value="/usr/bin/unrar",
+        ):
+            extractors = download_documento_seia._find_rar_extractors()
+
+        self.assertEqual(
+            extractors,
+            [
+                ("7z", "/usr/bin/7z"),
+                ("unar", "/usr/bin/unar"),
+                ("unrar", "/usr/bin/unrar"),
+            ],
+        )
+
+    def test_rar_extraction_rejects_partial_nonzero_result(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_path = tmp_path / "archivo.rar"
+            extract_dir = tmp_path / "archivo"
+            archive_path.write_bytes(b"rar")
+
+            def fake_run(cmd, **_kwargs):
+                output_arg = next(arg for arg in cmd if str(arg).startswith("-o") and arg != "-o+")
+                output_dir = Path(str(output_arg)[2:])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "parcial.pdf").write_bytes(b"parcial")
+                return SimpleNamespace(returncode=2, stderr="CRC error", stdout="")
+
+            with patch.object(
+                download_documento_seia,
+                "_find_rar_extractors",
+                return_value=[("7z", "7z")],
+            ), patch.object(
+                download_documento_seia.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(
+                download_documento_seia.sys,
+                "platform",
+                "linux",
+            ):
+                count, error = download_documento_seia._extract_rar_with_unrar(
+                    archive_path,
+                    extract_dir,
+                )
+
+        self.assertEqual(count, 0)
+        self.assertIn("7z error (code 2)", error)
+        self.assertIn("extraccion parcial descartada", error)
+        self.assertFalse(extract_dir.exists())
+
+    def test_rar_extraction_falls_back_after_failed_7z(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = Path(tmp_dir)
+            archive_path = tmp_path / "archivo.rar"
+            extract_dir = tmp_path / "archivo"
+            archive_path.write_bytes(b"rar")
+
+            def fake_run(cmd, **_kwargs):
+                if cmd[0] == "7z":
+                    return SimpleNamespace(returncode=2, stderr="unsupported rar", stdout="")
+                output_dir = Path(cmd[cmd.index("-output-directory") + 1])
+                output_dir.mkdir(parents=True, exist_ok=True)
+                (output_dir / "final.pdf").write_bytes(b"final")
+                return SimpleNamespace(returncode=0, stderr="", stdout="")
+
+            with patch.object(
+                download_documento_seia,
+                "_find_rar_extractors",
+                return_value=[("7z", "7z"), ("unar", "unar")],
+            ), patch.object(
+                download_documento_seia.subprocess,
+                "run",
+                side_effect=fake_run,
+            ), patch.object(
+                download_documento_seia.sys,
+                "platform",
+                "linux",
+            ):
+                count, error = download_documento_seia._extract_rar_with_unrar(
+                    archive_path,
+                    extract_dir,
+                )
+
+            self.assertIsNone(error)
+            self.assertEqual(count, 1)
+            self.assertTrue(any(path.name == "final.pdf" for path in extract_dir.rglob("*.pdf")))
+
+
 if __name__ == "__main__":
     unittest.main()
